@@ -192,6 +192,13 @@ function workspaceCapabilitiesMatch(
       (workspace, index) =>
         workspace.id === executor.workspaces[index]?.id &&
         workspace.name === executor.workspaces[index]?.name &&
+        workspace.environment?.fingerprint === executor.workspaces[index]?.environment?.fingerprint &&
+        workspace.environment?.repo === executor.workspaces[index]?.environment?.repo &&
+        workspace.environment?.ref === executor.workspaces[index]?.environment?.ref &&
+        workspace.environment?.actions.length === executor.workspaces[index]?.environment?.actions.length &&
+        (workspace.environment?.actions.every(
+          (action, actionIndex) => action === executor.workspaces[index]?.environment?.actions[actionIndex],
+        ) ?? executor.workspaces[index]?.environment == null) &&
         workspace.operations?.length ===
           executor.workspaces[index]?.operations?.length &&
         (workspace.operations?.every(
@@ -236,7 +243,9 @@ function registrationCompatibleCapabilities(
       return [];
     }
     const { operations: _operations, ...compatibleWorkspace } = workspace;
-    return [compatibleWorkspace];
+    return [{ ...compatibleWorkspace, ...(workspace.environment ? {
+      environment: { ...workspace.environment, actions: [] },
+    } : {}) }];
   });
   if (workspaces.length === 0) {
     const { workspaceTools: _workspaceTools, ...compatible } = capabilities;
@@ -312,13 +321,17 @@ function supportedWorkspaceCapabilities(
     editOperations.has(operation),
   );
   const workspaces = desired.workspaces.flatMap((workspace) => {
-    if (workspace.operations == null) return [workspace];
-    const workspaceOperations = workspace.operations.filter((operation) =>
+    const workspaceOperations = (workspace.operations ?? operations).filter((operation) =>
       operations.includes(operation),
     );
     return workspaceOperations.length === 0
       ? []
-      : [{ ...workspace, operations: workspaceOperations }];
+      : [{ ...workspace,
+          ...(workspace.operations ? { operations: workspaceOperations } : {}),
+          ...(workspace.environment && !workspaceOperations.includes('execute_command') ? {
+            environment: { ...workspace.environment, actions: [] },
+          } : {}),
+        }];
   });
   if (workspaces.length === 0) return undefined;
   const editFileFeatures = desired.editFileFeatures?.filter((feature) =>

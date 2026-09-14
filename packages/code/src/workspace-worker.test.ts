@@ -7,6 +7,30 @@ import { SandboxWorkspaceTools, WorkspaceToolError } from './workspace.js';
 
 const incarnationId = 'incarnation-00000001';
 
+test('worker clears named actions when command execution is not negotiated', async () => {
+  const workspaceTools = {
+    protocolVersion: 1 as const,
+    operations: ['read_file' as const, 'execute_command' as const],
+    workspaces: [{ id: 'primary', environment: { fingerprint: 'a'.repeat(64), actions: ['test'] } }],
+  };
+  const registrations: Array<typeof workspaceTools> = [];
+  const worker = new BridgeWorker({
+    codeApiUrl: 'https://code.example/v1', token: 'worker-secret', workerId: 'vm-1', incarnationId,
+    sandboxEndpoint: 'http://127.0.0.1:2000/api/v2',
+    capabilities: { statefulWorkspace: true, sandboxProfile: 'nsjail', runtimes: ['bash'], workspaceTools },
+    workspaceMutationQuarantine: mutationQuarantine(),
+    workspaceTools: { capabilities: workspaceTools, async execute() { throw new Error('not executed'); } },
+    fetchImpl: async (_input, init) => {
+      registrations.push(JSON.parse(String(init?.body)).capabilities.workspaceTools);
+      return Response.json({ protocolVersion: 1, workerId: 'vm-1', incarnationId,
+        registeredAt: new Date().toISOString(), leaseTtlMs: 60000, supportedWorkspaceToolOperations: ['read_file'] });
+    },
+  });
+  await worker.register();
+  assert.ok(registrations.length > 0);
+  for (const registration of registrations) assert.deepEqual(registration.workspaces[0].environment.actions, []);
+});
+
 const listWorkspaceCapabilities = {
   protocolVersion: 1 as const,
   operations: [
@@ -2420,6 +2444,32 @@ test('worker refuses to advertise workspace tools without a matching executor', 
       }),
     /workspace tool capabilities require a matching executor/i,
   );
+});
+
+test('worker refuses environment metadata that differs from its executor', () => {
+  const environment = { fingerprint: 'a'.repeat(64), repo: 'owner/repo', ref: 'main', actions: [] as string[] };
+  const workspaceTools = {
+    protocolVersion: 1 as const,
+    operations: ['read_file' as const],
+    workspaces: [{ id: 'primary', environment }],
+  };
+  for (const changed of [
+    undefined,
+    { ...environment, fingerprint: 'b'.repeat(64) },
+    { ...environment, repo: 'other/repo' },
+    { ...environment, ref: 'other' },
+    { ...environment, actions: ['test'] },
+  ]) {
+    assert.throws(() => new BridgeWorker({
+      codeApiUrl: 'https://code.example/v1', token: 'worker-secret', workerId: 'vm-1', incarnationId,
+      sandboxEndpoint: 'http://127.0.0.1:2000/api/v2',
+      capabilities: { statefulWorkspace: true, sandboxProfile: 'nsjail', runtimes: ['bash'], workspaceTools },
+      workspaceTools: {
+        capabilities: { ...workspaceTools, workspaces: [{ id: 'primary', ...(changed ? { environment: changed } : {}) }] },
+        async execute() { throw new Error('not executed'); },
+      },
+    }), /workspace tool capabilities require a matching executor/i);
+  }
 });
 
 test('worker requires durable quarantine before advertising command execution', () => {
