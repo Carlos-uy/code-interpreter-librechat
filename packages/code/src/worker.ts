@@ -38,6 +38,11 @@ export interface BridgeWorkerOptions {
   capabilities: BridgeWorkerCapabilities;
   workspaceTools?: WorkspaceToolExecutor;
   workspaceProgrammatic?: {
+    /**
+     * True when a WorkspaceToolError without mutation uncertainty proves the
+     * selected workspace was not changed.
+     */
+    mutationFailuresAreAtomic?: true;
     executeProgrammatic(
       workspaceId: string,
       request: BridgeWorkspaceProgrammaticRequest,
@@ -99,6 +104,7 @@ const DEFAULT_REGISTRATION_TRANSPORT_TIMEOUT_MS = 10_000;
 const DEFAULT_CONTROL_TRANSPORT_TIMEOUT_MS = 10_000;
 const DEFAULT_CANCELLATION_POLL_INTERVAL_MS = 500;
 const DEFAULT_CANCELLATION_TRANSPORT_TIMEOUT_MS = 2_000;
+const CREDENTIAL_REFRESH_SETTLEMENT_GRACE_MS = 1_000;
 const MIN_REGISTRATION_HEARTBEAT_MS = 25;
 const REGISTRATION_RETRY_DELAY_MS = 100;
 const CREDENTIAL_REFRESH_RETRY_DELAY_MS = 100;
@@ -158,26 +164,29 @@ function workspaceCapabilitiesMatch(
     advertised.writeFileModes?.length === executor.writeFileModes?.length &&
     (advertised.writeFileModes?.every(
       (mode, index) => mode === executor.writeFileModes?.[index],
-    ) ?? executor.writeFileModes == null) &&
+    ) ??
+      executor.writeFileModes == null) &&
     advertised.editFileModes?.length === executor.editFileModes?.length &&
     (advertised.editFileModes?.every(
       (mode, index) => mode === executor.editFileModes?.[index],
-    ) ?? executor.editFileModes == null) &&
-    advertised.editFileFeatures?.length ===
-      executor.editFileFeatures?.length &&
+    ) ??
+      executor.editFileModes == null) &&
+    advertised.editFileFeatures?.length === executor.editFileFeatures?.length &&
     (advertised.editFileFeatures?.every(
       (feature, index) => feature === executor.editFileFeatures?.[index],
-    ) ?? executor.editFileFeatures == null) &&
-    advertised.listFileFeatures?.length ===
-      executor.listFileFeatures?.length &&
+    ) ??
+      executor.editFileFeatures == null) &&
+    advertised.listFileFeatures?.length === executor.listFileFeatures?.length &&
     (advertised.listFileFeatures?.every(
       (feature, index) => feature === executor.listFileFeatures?.[index],
-    ) ?? executor.listFileFeatures == null) &&
+    ) ??
+      executor.listFileFeatures == null) &&
     advertised.programmaticLanguages?.length ===
       executor.programmaticLanguages?.length &&
     (advertised.programmaticLanguages?.every(
       (language, index) => language === executor.programmaticLanguages?.[index],
-    ) ?? executor.programmaticLanguages == null) &&
+    ) ??
+      executor.programmaticLanguages == null) &&
     advertised.workspaces.length === executor.workspaces.length &&
     advertised.workspaces.every(
       (workspace, index) =>
@@ -189,7 +198,8 @@ function workspaceCapabilitiesMatch(
           (operation, operationIndex) =>
             operation ===
             executor.workspaces[index]?.operations?.[operationIndex],
-        ) ?? executor.workspaces[index]?.operations == null),
+        ) ??
+          executor.workspaces[index]?.operations == null),
     )
   );
 }
@@ -201,8 +211,7 @@ function registrationCompatibleCapabilities(
   if (
     workspaceTools == null ||
     (workspaceTools.operations.every(
-      (operation) =>
-        operation === 'read_file' || operation === 'search_text',
+      (operation) => operation === 'read_file' || operation === 'search_text',
     ) &&
       workspaceTools.workspaces.every(
         (workspace) => workspace.operations == null,
@@ -211,8 +220,7 @@ function registrationCompatibleCapabilities(
     return capabilities;
   }
   const operations = workspaceTools.operations.filter(
-    (operation) =>
-      operation === 'read_file' || operation === 'search_text',
+    (operation) => operation === 'read_file' || operation === 'search_text',
   );
   if (operations.length === 0) {
     const { workspaceTools: _workspaceTools, ...compatible } = capabilities;
@@ -221,7 +229,9 @@ function registrationCompatibleCapabilities(
   const workspaces = workspaceTools.workspaces.flatMap((workspace) => {
     if (
       workspace.operations != null &&
-      !operations.every((operation) => workspace.operations?.includes(operation))
+      !operations.every((operation) =>
+        workspace.operations?.includes(operation),
+      )
     ) {
       return [];
     }
@@ -386,7 +396,11 @@ export class BridgeWorker {
   private negotiatedWorkspaceSlots = 1;
   private concurrentRunning = false;
   private registrationInFlight?: Promise<BridgeWorkerRegistrationResponse>;
-  private credentialInFlight?: Promise<void>;
+  private credentialInFlight?: {
+    promise: Promise<void>;
+    controller: AbortController;
+    waiters: number;
+  };
   private serverClockOffsetMs = MAX_PROOF_CLOCK_SKEW_MS;
 
   constructor(private readonly options: BridgeWorkerOptions) {
@@ -434,7 +448,8 @@ export class BridgeWorker {
       (options.workspaceProgrammatic != null) !==
       (options.capabilities.workspaceTools?.programmaticLanguages?.includes(
         'bash',
-      ) === true)
+      ) ===
+        true)
     ) {
       throw new BridgeProtocolError(
         'Workspace programmatic capability requires a matching executor',
@@ -553,7 +568,9 @@ export class BridgeWorker {
     if (signal?.aborted) {
       abortRegistration();
     } else {
-      signal?.addEventListener('abort', abortRegistration, { once: true });
+      signal?.addEventListener('abort', abortRegistration, {
+        once: true,
+      });
     }
     const timeoutMs = Math.min(
       Math.max(1, this.registrationTtlMs - 1),
@@ -575,7 +592,10 @@ export class BridgeWorker {
             workerId: this.options.workerId,
             incarnationId: this.incarnationId,
             capabilities: this.maintenanceOnly
-              ? { ...capabilities, requiresReadyConfirmation: true }
+              ? {
+                  ...capabilities,
+                  requiresReadyConfirmation: true,
+                }
               : capabilities,
           },
           registrationController.signal,
@@ -709,7 +729,9 @@ export class BridgeWorker {
     }
     await this.runtimeSupervisor.reset(runtimeSessionId, signal);
     await this.timedRequest(
-      `${this.codeApiUrl}${bridgeWorkerPath(this.options.workerId)}/workspaces/reset`,
+      `${this.codeApiUrl}${bridgeWorkerPath(
+        this.options.workerId,
+      )}/workspaces/reset`,
       {
         protocolVersion: BRIDGE_PROTOCOL_VERSION,
         incarnationId: this.incarnationId,
@@ -745,7 +767,9 @@ export class BridgeWorker {
     // machine-local guard before the remote fence can be removed.
     await guard.assertAvailable();
     await this.timedRequest(
-      `${this.codeApiUrl}${bridgeWorkerPath(this.options.workerId)}/workspaces/reset`,
+      `${this.codeApiUrl}${bridgeWorkerPath(
+        this.options.workerId,
+      )}/workspaces/reset`,
       {
         protocolVersion: BRIDGE_PROTOCOL_VERSION,
         incarnationId: this.incarnationId,
@@ -1051,20 +1075,58 @@ export class BridgeWorker {
     transportTimeoutMs = Number.POSITIVE_INFINITY,
   ): Promise<void> {
     while (this.credentialInFlight) {
-      await this.credentialInFlight;
+      await this.waitForCredentialRefresh(this.credentialInFlight, signal);
       // A longer-lived caller may still need another refresh after this one.
     }
+    const controller = new AbortController();
     const pending = this.refreshCredentialOwned(
-      signal,
+      controller.signal,
       validThroughMs,
       transportTimeoutMs,
     );
-    this.credentialInFlight = pending;
+    const entry = { promise: pending, controller, waiters: 0 };
+    this.credentialInFlight = entry;
+    void pending.then(
+      () => {
+        if (this.credentialInFlight === entry)
+          this.credentialInFlight = undefined;
+      },
+      () => {
+        if (this.credentialInFlight === entry)
+          this.credentialInFlight = undefined;
+      },
+    );
+    await this.waitForCredentialRefresh(entry, signal);
+  }
+
+  private async waitForCredentialRefresh(
+    entry: NonNullable<BridgeWorker['credentialInFlight']>,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    entry.waiters += 1;
+    let removeAbortListener = (): void => {};
+    const aborted = new Promise<never>((_, reject) => {
+      if (signal == null) return;
+      const abort = (): void =>
+        reject(
+          signal.reason instanceof Error
+            ? signal.reason
+            : new DOMException('aborted', 'AbortError'),
+        );
+      removeAbortListener = (): void =>
+        signal.removeEventListener('abort', abort);
+      signal.addEventListener('abort', abort, { once: true });
+      if (signal.aborted) abort();
+    });
     try {
-      await pending;
+      await Promise.race([entry.promise, aborted]);
     } finally {
-      if (this.credentialInFlight === pending)
+      removeAbortListener();
+      entry.waiters -= 1;
+      if (entry.waiters === 0 && this.credentialInFlight === entry) {
         this.credentialInFlight = undefined;
+        entry.controller.abort();
+      }
     }
   }
 
@@ -1118,7 +1180,7 @@ export class BridgeWorker {
     assignment: BridgeAssignment,
     stopSignal: AbortSignal,
     serverClockOffsetMs: number,
-    requestSignal?: AbortSignal,
+    maintenance: { refresh?: Promise<void> },
   ): Promise<void> {
     const identity = this.options.identity;
     if (identity == null) return;
@@ -1136,18 +1198,18 @@ export class BridgeWorker {
       await abortableDelay(waitMs, stopSignal);
       if (stopSignal.aborted || Date.now() >= assignmentDeadlineMs) return;
       try {
-        await this.refreshCredential(
-          requestSignal,
+        maintenance.refresh = this.refreshCredential(
+          stopSignal,
           Date.now() + serverClockOffsetMs + refreshWindowMs,
         );
+        await maintenance.refresh;
       } catch (error) {
         if (stopSignal.aborted) return;
         const terminal =
           error instanceof BridgeProtocolError &&
           (error.status === 401 || error.status === 403);
         const credentialRemainingMs =
-          Date.parse(identity.expiresAt) -
-          (Date.now() + serverClockOffsetMs);
+          Date.parse(identity.expiresAt) - (Date.now() + serverClockOffsetMs);
         if (terminal || credentialRemainingMs <= 0) throw error;
         await abortableDelay(
           Math.min(
@@ -1156,6 +1218,8 @@ export class BridgeWorker {
           ),
           stopSignal,
         );
+      } finally {
+        maintenance.refresh = undefined;
       }
     }
   }
@@ -1352,6 +1416,7 @@ export class BridgeWorker {
     );
     let credentialMaintenanceError: unknown;
     let credentialMaintenance: Promise<void> | undefined;
+    const ownCredentialMaintenance: { refresh?: Promise<void> } = {};
     let settlement: BridgeSettlement;
     let ambiguousSandboxError: unknown;
     let ambiguousWorkspaceMutationError: unknown;
@@ -1368,7 +1433,7 @@ export class BridgeWorker {
         assignment,
         credentialController.signal,
         serverClockOffsetMs,
-        signal,
+        ownCredentialMaintenance,
       ).catch((error) => {
         credentialMaintenanceError = error;
         executionController.abort();
@@ -1674,14 +1739,22 @@ export class BridgeWorker {
       ) {
         workspaceMutationGuardError = error;
       }
+      const knownAtomicWorkspaceToolFailure =
+        assignment.executionKind === 'workspace_tool' &&
+        error instanceof WorkspaceToolError &&
+        this.options.workspaceTools?.mutationFailuresAreAtomic === true &&
+        !error.requiresQuarantine;
+      const knownAtomicProgrammaticFailure =
+        assignment.executionKind === 'workspace_programmatic' &&
+        error instanceof WorkspaceToolError &&
+        this.options.workspaceProgrammatic?.mutationFailuresAreAtomic ===
+          true &&
+        !error.requiresQuarantine;
       if (
         workspaceMutationApplied ||
         (workspaceMutationArmed &&
-          !(
-            error instanceof WorkspaceToolError &&
-            this.options.workspaceTools?.mutationFailuresAreAtomic === true &&
-            !error.requiresQuarantine
-          ))
+          !knownAtomicWorkspaceToolFailure &&
+          !knownAtomicProgrammaticFailure)
       ) {
         ambiguousWorkspaceMutationError = error;
       }
@@ -1713,12 +1786,30 @@ export class BridgeWorker {
     clearTimeout(deadlineTimer);
     cancellationController.abort();
     await cancellationWatcher;
+    // Only drain renewal joined by this assignment, never an unrelated lane's
+    // refresh. Leave settlement time inside the original assignment budget.
+    const credentialInFlight = ownCredentialMaintenance.refresh;
+    if (credentialInFlight != null && !credentialController.signal.aborted) {
+      let drainTimer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        credentialInFlight.catch(() => undefined),
+        new Promise<void>((resolve) => {
+          drainTimer = setTimeout(
+            resolve,
+            Math.min(CREDENTIAL_REFRESH_SETTLEMENT_GRACE_MS,
+              Math.max(0, Date.parse(assignment.expiresAt) - serverClockOffsetMs - Date.now() - 5_000)),
+          );
+        }),
+      ]);
+      if (drainTimer != null) clearTimeout(drainTimer);
+    }
     credentialController.abort();
     await credentialMaintenance;
     try {
       if (workspaceMutationGuardError != null)
         throw workspaceMutationGuardError;
       if (ambiguousWorkspaceMutationError != null) {
+        this.options.onError?.(ambiguousWorkspaceMutationError);
         throw await this.quarantineWorkspace(
           undefined,
           'Worker stopped after a workspace mutation completed without a fulfilled settlement',
@@ -1913,7 +2004,9 @@ export class BridgeWorker {
       return await lease.execute({ body, headers, signal });
     }
     if (lease.endpoint == null) {
-      throw new BridgeProtocolError('Runtime lease does not provide an execution transport');
+      throw new BridgeProtocolError(
+        'Runtime lease does not provide an execution transport',
+      );
     }
     const endpoint = lease.endpoint.replace(/\/+$/, '');
     const response = await this.fetchImpl(`${endpoint}/execute`, {
@@ -2170,17 +2263,23 @@ export class BridgeWorker {
     signal: AbortSignal,
   ): Promise<void> {
     while (!signal.aborted && !executionController.signal.aborted) {
-      await this.delay(
-        Math.max(
-          1,
-          this.options.cancellationPollIntervalMs ??
-            DEFAULT_CANCELLATION_POLL_INTERVAL_MS,
-        ),
-        signal,
-      );
+      try {
+        await this.delay(
+          Math.max(
+            1,
+            this.options.cancellationPollIntervalMs ??
+              DEFAULT_CANCELLATION_POLL_INTERVAL_MS,
+          ),
+          signal,
+        );
+      } catch (error) {
+        if (signal.aborted || executionController.signal.aborted) return;
+        throw error;
+      }
       if (signal.aborted || executionController.signal.aborted) return;
       const pollController = new AbortController();
       const abortPoll = (): void => pollController.abort();
+      signal.addEventListener('abort', abortPoll, { once: true });
       executionController.signal.addEventListener('abort', abortPoll, {
         once: true,
       });
@@ -2200,6 +2299,15 @@ export class BridgeWorker {
             incarnationId: this.incarnationId,
           },
           pollController.signal,
+          (response) => {
+            // Once response headers arrive, drain the bounded body before a
+            // successful execution can settle. Otherwise a cancellation=true
+            // response racing command completion can be discarded. The
+            // transport timer and execution signal still cap the drain.
+            if (response.ok || response.status === 404) {
+              signal.removeEventListener('abort', abortPoll);
+            }
+          },
         );
         if (response.cancelled) {
           executionController.abort();
@@ -2213,6 +2321,7 @@ export class BridgeWorker {
         if (signal.aborted) return;
       } finally {
         clearTimeout(timeout);
+        signal.removeEventListener('abort', abortPoll);
         executionController.signal.removeEventListener('abort', abortPoll);
       }
     }
@@ -2222,6 +2331,7 @@ export class BridgeWorker {
     url: string,
     body: object,
     signal?: AbortSignal,
+    onResponseHeaders?: (response: Response) => void,
   ): Promise<T> {
     const requestBody = JSON.stringify(body);
     const response = await this.fetchImpl(url, {
@@ -2233,6 +2343,7 @@ export class BridgeWorker {
       body: requestBody,
       signal,
     });
+    onResponseHeaders?.(response);
     let payload: unknown;
     try {
       payload = await response.json();

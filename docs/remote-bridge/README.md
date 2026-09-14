@@ -256,6 +256,23 @@ execution.
   the currently registered incarnation.
 - Request cancellation is polled by the worker and aborts the local sandbox
   request.
+- Replay PTC clients may attach a fresh `X-LibreChat-Code-Request-ID` to each
+  `/exec/programmatic` request and send that same opaque ID to
+  `POST /v1/exec/programmatic/cancel`. Code API binds the short-lived request
+  record to the authenticated principal, durably marks cancellation in Redis,
+  and publishes it to the worker process holding the BullMQ job. This explicit
+  path avoids relying on HTTP connection teardown, frees waiting jobs
+  immediately, and interrupts active remote-bridge assignments without polling
+  once per active job.
+  Cancellation and completed-result publication use an atomic Redis decision:
+  a late cancel returns `already_completed` instead of acknowledging Stop after
+  completion won. Ambiguous enqueue/cancellation errors retain replay ownership
+  until a durable fence or the original job deadline. Completed results are
+  retained temporarily (bounded to 16 MiB) so a lost BullMQ completion reply
+  does not cause sandbox effects to be repeated. Reconnect reconciliation reads
+  only small status markers, using one subscriber per process.
+  Roll out the matching Code API queue-worker processes before enabling this
+  endpoint on API replicas; pre-cancellation workers do not observe its markers.
 - A leased assignment remains in a Redis-backed delivery claim until the worker
   explicitly acknowledges it; reconnecting before acknowledgement redelivers
   the same fenced assignment instead of losing it after an HTTP disconnect.
