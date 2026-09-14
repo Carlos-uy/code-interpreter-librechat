@@ -655,6 +655,8 @@ interface ExecuteResult {
   /** Top-level execution session id (one sandbox `/exec` invocation). */
   session_id: string;
   files: FileRef[];
+  /** Persisted input paths that no longer exist after this execution. */
+  deleted_files?: string[];
   artifact_delivery?: ArtifactDeliveryFailure;
   artifact_truncation?: ArtifactTruncation;
 }
@@ -714,6 +716,8 @@ export class Job {
   private pendingSurfaced = new Map<string, { name: string; signature: string }>();
   private sessionFiles: FileRef[] = [];
   private inheritedRefs: FileRef[] = [];
+  private presentInputFiles = new Set<string>();
+  private deletedFiles: string[] = [];
   private artifactTruncation: ArtifactTruncation | undefined;
   private truncationProbeState: TruncationProbeState = {
     remainingEntries: TRUNCATION_PROBE_MAX_ENTRIES,
@@ -1699,6 +1703,9 @@ export class Job {
       version: this.runtime.version.raw,
       session_id: this.outputSessionId,
       files: this.sessionFiles,
+      ...(this.deletedFiles.length > 0
+        ? { deleted_files: this.deletedFiles }
+        : {}),
       ...(this.artifactTruncation ? { artifact_truncation: this.artifactTruncation } : {}),
     };
   }
@@ -1707,6 +1714,8 @@ export class Job {
     this.generatedFiles = [];
     this.sessionFiles = [];
     this.inheritedRefs = [];
+    this.presentInputFiles.clear();
+    this.deletedFiles = [];
     this.artifactTruncation = undefined;
     this.truncationProbeState = {
       remainingEntries: TRUNCATION_PROBE_MAX_ENTRIES,
@@ -1720,6 +1729,26 @@ export class Job {
       await this.walkDir(this.submissionDir, 0, inputByName);
     } catch (error) {
       this.log.error({ err: error }, 'Error scanning submission directory');
+      this.recordArtifactTruncation('unreadable', '.');
+    }
+
+    if (this.artifactTruncation == null) {
+      const returnedNames = new Set([
+        ...this.sessionFiles.map(file => file.name),
+        ...this.inheritedRefs.map(file => file.name),
+      ]);
+      for (const file of this.files) {
+        if (
+          file.id != null &&
+          file.storage_session_id != null &&
+          this.inputFileHashes.get(file.name)?.readOnly !== true &&
+          !this.presentInputFiles.has(file.name) &&
+          !returnedNames.has(file.name)
+        ) {
+          this.deletedFiles.push(file.name);
+          this.session?.forgetPrimed(file.name);
+        }
+      }
     }
 
     /* Generated files get priority in sessionFiles; fill remaining slots up
@@ -2227,13 +2256,18 @@ export class Job {
     let sawVisibleNonHiddenEntry = false;
     try {
       for await (const entry of directory) {
-        if (entry.name === PTC_HISTORY_FILENAME) continue;
-        sawVisibleEntry = true;
-        state.remainingEntries--;
-        if (state.remainingEntries < 0) return rootPath;
         const fullPath = path.join(dir, entry.name);
         const relativePath = path.relative(this.submissionDir, fullPath);
         const kind = await this.classifyDirent(entry, fullPath, relativePath);
+        if (kind === 'file' && entry.name === PTC_HISTORY_FILENAME) {
+          if (inputByName.has(relativePath)) {
+            this.presentInputFiles.add(relativePath);
+          }
+          continue;
+        }
+        sawVisibleEntry = true;
+        state.remainingEntries--;
+        if (state.remainingEntries < 0) return rootPath;
         if (kind === 'skip') {
           /* Ordinary walking counts symlinks/special entries as non-empty even
            * though it does not surface them, so the probe must not invent a
@@ -2243,6 +2277,9 @@ export class Job {
         }
         if (kind === 'file') {
           sawVisibleNonHiddenEntry = true;
+          if (inputByName.has(relativePath)) {
+            this.presentInputFiles.add(relativePath);
+          }
           if (entry.name !== DIRKEEP && !isSupportedOutputFilename(entry.name)) continue;
           const existingFile = inputByName.get(relativePath);
           const inputFileInfo = this.inputFileHashes.get(relativePath);
@@ -2423,12 +2460,20 @@ export class Job {
     let skippedHiddenDirs = 0;
 
     for (const entry of entries) {
-      if (isPtcReserved(entry.name)) continue;
-
       const fullPath = path.join(dir, entry.name);
       const relativePath = path.relative(this.submissionDir, fullPath);
       const kind = await this.classifyDirent(entry, fullPath, relativePath);
       if (kind === 'skip') continue;
+
+      if (kind === 'file' && inputByName.has(relativePath)) {
+        this.presentInputFiles.add(relativePath);
+      }
+
+      /* A by-reference input may legitimately use the reserved replay-history
+       * basename on the ordinary execution endpoint. It remains hidden from
+       * output collection, but must be observed before the runtime fixture is
+       * skipped so an untouched input is not reported as deleted. */
+      if (kind === 'file' && isPtcReserved(entry.name)) continue;
 
       if (kind === 'dir') {
         /* Skip hidden directories (basename starts with `.`) unless the user
