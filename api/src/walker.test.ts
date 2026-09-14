@@ -26,11 +26,19 @@ interface WalkerInternals {
   generatedFiles: Array<{ id: string; name: string; path: string }>;
   sessionFiles: Array<{ id: string; name: string; storage_session_id: string; modified_from?: { id: string; storage_session_id: string }; inherited?: true; entity_id?: string }>;
   inheritedRefs: Array<{ id: string; name: string; storage_session_id: string; inherited?: true; entity_id?: string }>;
+  artifactTruncation?: {
+    code: 'artifact_truncated';
+    reasons: Partial<Record<'max_files' | 'depth' | 'size' | 'path' | 'unreadable', number>>;
+    skipped: string[];
+    skipped_count: number;
+  };
+  truncationProbeState: { remainingEntries: number; remainingHashBytes: number };
   pendingSurfaced: Map<string, { name: string; signature: string }>;
   inputFileHashes: Map<string, { hash: string; path: string; originalId?: string; originalSessionId?: string; readOnly?: boolean }>;
   files: TFile[];
   reusePrimedInput: (file: TFile) => Promise<boolean>;
   writeFile: (file: TFile) => Promise<void>;
+  computeFileHash: (filePath: string, noFollow?: boolean) => Promise<string>;
   walkDir: (dir: string, depth: number, inputByName: Map<string, TFile>) => Promise<'collected' | 'empty' | 'skipped'>;
   handleSessionFiles: () => Promise<void>;
 }
@@ -743,6 +751,10 @@ describe('walkDir / output caps', () => {
     await internals.walkDir(tmpDir, 0, new Map());
 
     expect(internals.generatedFiles.length).toBeLessThanOrEqual(cap);
+    expect(internals.artifactTruncation).toMatchObject({
+      code: 'artifact_truncated',
+      reasons: { max_files: 1 },
+    });
   });
 
   it('respects max_output_files cap on inherited refs', async () => {
@@ -771,6 +783,11 @@ describe('walkDir / output caps', () => {
 
     expect(internals.inheritedRefs.length).toBeLessThanOrEqual(cap);
     expect(internals.generatedFiles).toHaveLength(0);
+    expect(internals.artifactTruncation).toMatchObject({
+      code: 'artifact_truncated',
+      reasons: { max_files: 5 },
+      skipped_count: 5,
+    });
   });
 });
 
@@ -792,6 +809,364 @@ describe('walkDir / depth cap', () => {
 
     const deepName = path.relative(tmpDir, path.join(cursor, 'deep.py'));
     expect(internals.generatedFiles.map(f => f.name)).not.toContain(deepName);
+    expect(internals.artifactTruncation).toMatchObject({
+      code: 'artifact_truncated',
+      reasons: { depth: 1 },
+      skipped_count: 1,
+    });
+    expect(internals.artifactTruncation?.skipped[0]).toBe(deepName);
+  });
+
+  it('does not report a depth cap when the skipped subtree has only unsupported files', async () => {
+    let cursor = tmpDir;
+    for (let i = 0; i < config.max_nesting_depth; i++) {
+      cursor = path.join(cursor, `d${i}`);
+      await fsp.mkdir(cursor);
+    }
+    await fsp.writeFile(path.join(cursor, 'cache.bin'), 'ignored');
+    const internals = asInternals(makeJob());
+    internals.submissionDir = tmpDir;
+
+    await internals.walkDir(tmpDir, 0, new Map());
+
+    expect(internals.artifactTruncation).toBeUndefined();
+  });
+
+  it('bounds depth-cap eligibility probes and reports the capped subtree conservatively', async () => {
+    let cursor = tmpDir;
+    const totalDepth = config.max_nesting_depth + 12;
+    for (let i = 0; i < totalDepth; i++) {
+      cursor = path.join(cursor, `d${i}`);
+      await fsp.mkdir(cursor);
+    }
+    await fsp.writeFile(path.join(cursor, 'cache.bin'), 'ignored');
+    const internals = asInternals(makeJob());
+    internals.submissionDir = tmpDir;
+
+    await internals.walkDir(tmpDir, 0, new Map());
+
+    const cappedRoot = Array.from(
+      { length: config.max_nesting_depth },
+      (_, i) => `d${i}`,
+    ).join(path.sep);
+    expect(internals.artifactTruncation).toEqual({
+      code: 'artifact_truncated',
+      reasons: { depth: 1 },
+      skipped: [cappedRoot],
+      skipped_count: 1,
+    });
+  });
+});
+
+describe('walkDir / artifact truncation details', () => {
+  it('reports oversized supported outputs while leaving them out of files', async () => {
+    await fsp.writeFile(path.join(tmpDir, 'large.txt'), 'too large');
+    const job = makeJob({ maxFileSize: 3 });
+    const internals = asInternals(job);
+    internals.submissionDir = tmpDir;
+
+    await internals.walkDir(tmpDir, 0, new Map());
+
+    expect(internals.generatedFiles).toHaveLength(0);
+    expect(internals.artifactTruncation).toEqual({
+      code: 'artifact_truncated',
+      reasons: { size: 1 },
+      skipped: ['large.txt'],
+      skipped_count: 1,
+    });
+  });
+
+  it('reports overlong output paths', async () => {
+    const directory = 'a'.repeat(200);
+    await fsp.mkdir(path.join(tmpDir, directory));
+    const name = path.join(directory, `${'b'.repeat(60)}.txt`);
+    await fsp.writeFile(path.join(tmpDir, name), 'content');
+    const job = makeJob();
+    const internals = asInternals(job);
+    internals.submissionDir = tmpDir;
+
+    await internals.walkDir(tmpDir, 0, new Map());
+
+    expect(internals.artifactTruncation).toEqual({
+      code: 'artifact_truncated',
+      reasons: { path: 1 },
+      skipped: [name],
+      skipped_count: 1,
+    });
+  });
+
+  it('does not report an overlong path for an unsupported output', async () => {
+    const directory = 'a'.repeat(200);
+    await fsp.mkdir(path.join(tmpDir, directory));
+    await fsp.writeFile(path.join(tmpDir, directory, `${'b'.repeat(60)}.bin`), 'ignored');
+    const job = makeJob();
+    const internals = asInternals(job);
+    internals.submissionDir = tmpDir;
+
+    await internals.walkDir(tmpDir, 0, new Map());
+
+    expect(internals.generatedFiles).toHaveLength(0);
+    expect(internals.artifactTruncation).toBeUndefined();
+  });
+
+  it('reports an empty-directory marker whose appended path is too long', async () => {
+    const directory = 'a'.repeat(config.max_path_length - 6);
+    await fsp.mkdir(path.join(tmpDir, directory));
+    const job = makeJob();
+    const internals = asInternals(job);
+    internals.submissionDir = tmpDir;
+
+    await internals.walkDir(tmpDir, 0, new Map());
+
+    expect(internals.artifactTruncation).toEqual({
+      code: 'artifact_truncated',
+      reasons: { path: 1 },
+      skipped: [path.join(directory, DIRKEEP)],
+      skipped_count: 1,
+    });
+  });
+
+  it('reports an explicit overlong .dirkeep exactly once', async () => {
+    const directory = 'a'.repeat(config.max_path_length - 6);
+    await fsp.mkdir(path.join(tmpDir, directory));
+    const keepName = path.join(directory, DIRKEEP);
+    await fsp.writeFile(path.join(tmpDir, keepName), '');
+    const internals = asInternals(makeJob());
+    internals.submissionDir = tmpDir;
+
+    await internals.walkDir(tmpDir, 0, new Map());
+
+    expect(internals.artifactTruncation).toEqual({
+      code: 'artifact_truncated',
+      reasons: { path: 1 },
+      skipped: [keepName],
+      skipped_count: 1,
+    });
+  });
+
+  it('uses a bounded probe instead of recursively walking an overlong directory', async () => {
+    const first = 'a'.repeat(200);
+    const second = 'b'.repeat(60);
+    const overlongDir = path.join(first, second);
+    await fsp.mkdir(path.join(tmpDir, overlongDir), { recursive: true });
+    for (let i = 0; i < 1001; i++) {
+      await fsp.writeFile(path.join(tmpDir, overlongDir, `ignored-${i}.bin`), 'ignored');
+    }
+    const internals = asInternals(makeJob());
+    internals.submissionDir = tmpDir;
+
+    await internals.walkDir(tmpDir, 0, new Map());
+
+    expect(internals.artifactTruncation).toEqual({
+      code: 'artifact_truncated',
+      reasons: { path: 1 },
+      skipped: [overlongDir],
+      skipped_count: 1,
+    });
+  });
+
+  it('does not report an unchanged oversized inline entrypoint', async () => {
+    const name = 'main.py';
+    const content = 'print(1)';
+    const full = path.join(tmpDir, name);
+    await fsp.writeFile(full, content);
+    const inline: TFile = { name, content };
+    const job = makeJob({ files: [inline], maxFileSize: 3 });
+    const internals = asInternals(job);
+    internals.submissionDir = tmpDir;
+    internals.entryPointName = name;
+    internals.inputFileHashes.set(name, { hash: sha256(content), path: full });
+
+    await internals.walkDir(tmpDir, 0, buildInputByName([inline]));
+
+    expect(internals.generatedFiles).toHaveLength(0);
+    expect(internals.artifactTruncation).toBeUndefined();
+  });
+
+  it('inspects a capped directory before deciding whether an artifact was omitted', async () => {
+    const job = makeJob();
+    const internals = asInternals(job);
+    internals.submissionDir = tmpDir;
+    internals.generatedFiles = Array.from({ length: config.max_output_files }, (_, i) => ({
+      id: `id-${i}`,
+      name: `file-${i}.txt`,
+      path: path.join(tmpDir, `file-${i}.txt`),
+    }));
+    await fsp.mkdir(path.join(tmpDir, 'ignored'));
+    await fsp.writeFile(path.join(tmpDir, 'ignored', 'cache.bin'), 'ignored');
+
+    await internals.walkDir(tmpDir, 0, new Map());
+
+    expect(internals.artifactTruncation).toBeUndefined();
+  });
+
+  it('reports a capped empty-directory marker', async () => {
+    const job = makeJob();
+    const internals = asInternals(job);
+    internals.submissionDir = tmpDir;
+    internals.generatedFiles = Array.from({ length: config.max_output_files }, (_, i) => ({
+      id: `id-${i}`,
+      name: `file-${i}.txt`,
+      path: path.join(tmpDir, `file-${i}.txt`),
+    }));
+    await fsp.mkdir(path.join(tmpDir, 'empty'));
+
+    await internals.walkDir(tmpDir, 0, new Map());
+
+    expect(internals.artifactTruncation).toEqual({
+      code: 'artifact_truncated',
+      reasons: { max_files: 1 },
+      skipped: [path.join('empty', DIRKEEP)],
+      skipped_count: 1,
+    });
+  });
+
+  it('does not hash ordinary oversized files in session mode', async () => {
+    await fsp.writeFile(path.join(tmpDir, 'large.txt'), 'too large');
+    const session = new SessionWorkspace({ runtimeSessionId: 'rt_large' });
+    const internals = asInternals(makeJob({ maxFileSize: 3, session }));
+    internals.submissionDir = tmpDir;
+    let hashCalls = 0;
+    internals.computeFileHash = async () => {
+      hashCalls++;
+      return sha256('too large');
+    };
+
+    await internals.walkDir(tmpDir, 0, new Map());
+
+    expect(hashCalls).toBe(0);
+    expect(internals.artifactTruncation?.reasons).toEqual({ size: 1 });
+  });
+
+  it('keeps scanning for generated outputs when only inherited refs are capped', async () => {
+    await fsp.mkdir(path.join(tmpDir, 'a-ignored'));
+    await fsp.writeFile(path.join(tmpDir, 'a-ignored', 'cache.bin'), 'ignored');
+    await fsp.writeFile(path.join(tmpDir, 'z-generated.txt'), 'new');
+    const internals = asInternals(makeJob());
+    internals.submissionDir = tmpDir;
+    internals.inheritedRefs = Array.from({ length: config.max_output_files }, (_, i) => ({
+      id: `id-${i}`,
+      name: `inherited-${i}.txt`,
+      storage_session_id: 'previous',
+      inherited: true,
+    }));
+    internals.artifactTruncation = {
+      code: 'artifact_truncated',
+      reasons: { max_files: 1 },
+      skipped: ['another-inherited.txt'],
+      skipped_count: 1,
+    };
+
+    await internals.walkDir(tmpDir, 0, new Map());
+
+    expect(internals.generatedFiles.map(file => file.name)).toContain('z-generated.txt');
+  });
+
+  it('bounds output-cap eligibility probes for wide unsupported-only directories', async () => {
+    const job = makeJob();
+    const internals = asInternals(job);
+    internals.submissionDir = tmpDir;
+    internals.generatedFiles = Array.from({ length: config.max_output_files }, (_, i) => ({
+      id: `id-${i}`,
+      name: `file-${i}.txt`,
+      path: path.join(tmpDir, `file-${i}.txt`),
+    }));
+    for (let i = 0; i < 1001; i++) {
+      await fsp.writeFile(path.join(tmpDir, `ignored-${i}.bin`), 'ignored');
+    }
+
+    await internals.walkDir(tmpDir, 0, new Map());
+
+    expect(internals.artifactTruncation).toEqual({
+      code: 'artifact_truncated',
+      reasons: { max_files: 1 },
+      skipped: ['.'],
+      skipped_count: 1,
+    });
+  });
+
+  it('shares the output-cap probe budget across sibling subtrees', async () => {
+    for (const dirname of ['b-ignored', 'c-ignored']) {
+      await fsp.mkdir(path.join(tmpDir, dirname));
+      for (let i = 0; i < 600; i++) {
+        await fsp.writeFile(path.join(tmpDir, dirname, `ignored-${i}.bin`), 'ignored');
+      }
+    }
+    const internals = asInternals(makeJob());
+    internals.submissionDir = tmpDir;
+    internals.generatedFiles = Array.from({ length: config.max_output_files }, (_, i) => ({
+      id: `id-${i}`,
+      name: `file-${i}.txt`,
+      path: path.join(tmpDir, `file-${i}.txt`),
+    }));
+
+    await internals.walkDir(path.join(tmpDir, 'b-ignored'), 1, new Map());
+    await internals.walkDir(path.join(tmpDir, 'c-ignored'), 1, new Map());
+
+    expect(internals.artifactTruncation?.reasons).toEqual({ max_files: 1 });
+    expect(internals.artifactTruncation?.skipped).toEqual(['c-ignored']);
+  });
+
+  it('does not report surfaced session artifacts during output-cap probing', async () => {
+    const name = 'old-output.txt';
+    const content = 'already returned';
+    await fsp.writeFile(path.join(tmpDir, name), content);
+    const session = new SessionWorkspace({ runtimeSessionId: 'rt_capped' });
+    session.markSurfaced(name, sha256(content));
+    const internals = asInternals(makeJob({ session }));
+    internals.submissionDir = tmpDir;
+    internals.generatedFiles = Array.from({ length: config.max_output_files }, (_, i) => ({
+      id: `id-${i}`,
+      name: `file-${i}.txt`,
+      path: path.join(tmpDir, `file-${i}.txt`),
+    }));
+
+    await internals.walkDir(tmpDir, 0, new Map());
+
+    expect(internals.artifactTruncation).toBeUndefined();
+  });
+
+  it('does not reopen capped directories after the shared probe budget is exhausted', async () => {
+    const internals = asInternals(makeJob());
+    internals.submissionDir = tmpDir;
+    internals.truncationProbeState.remainingEntries = 0;
+    internals.generatedFiles = Array.from({ length: config.max_output_files }, (_, i) => ({
+      id: `id-${i}`,
+      name: `file-${i}.txt`,
+      path: path.join(tmpDir, `file-${i}.txt`),
+    }));
+    const absentDir = path.join(tmpDir, 'not-opened');
+
+    await internals.walkDir(absentDir, 1, new Map());
+
+    expect(internals.artifactTruncation).toEqual({
+      code: 'artifact_truncated',
+      reasons: { max_files: 1 },
+      skipped: ['not-opened'],
+      skipped_count: 1,
+    });
+  });
+
+  it('does not report an unchanged inline entrypoint during output-cap probing', async () => {
+    const directory = path.join(tmpDir, 'src');
+    const name = path.join('src', 'main.py');
+    const content = 'print(1)';
+    await fsp.mkdir(directory);
+    await fsp.writeFile(path.join(tmpDir, name), content);
+    const inline: TFile = { name, content };
+    const internals = asInternals(makeJob({ files: [inline] }));
+    internals.submissionDir = tmpDir;
+    internals.entryPointName = name;
+    internals.inputFileHashes.set(name, { hash: sha256(content), path: path.join(tmpDir, name) });
+    internals.generatedFiles = Array.from({ length: config.max_output_files }, (_, i) => ({
+      id: `id-${i}`,
+      name: `file-${i}.txt`,
+      path: path.join(tmpDir, `file-${i}.txt`),
+    }));
+
+    await internals.walkDir(directory, 1, buildInputByName([inline]));
+
+    expect(internals.artifactTruncation).toBeUndefined();
   });
 });
 
