@@ -2,6 +2,7 @@ import { NativeProcessWorkspaceCommandSandbox } from './native-process.js';
 import { WorkspaceToolError } from './workspace.js';
 import type { NativeProcessSandboxOptions } from './native-process.js';
 import type {
+  BridgeWorkspaceProgrammaticRequest,
   WorkspaceExecuteCommandRequest,
   WorkspaceExecuteCommandResult,
 } from './protocol.js';
@@ -10,7 +11,10 @@ interface Entry {
   sandbox: Pick<
     NativeProcessWorkspaceCommandSandbox,
     'prepare' | 'execute' | 'close'
-  >;
+  > &
+    Partial<
+      Pick<NativeProcessWorkspaceCommandSandbox, 'executeProgrammatic'>
+    >;
   busy: boolean;
 }
 
@@ -92,12 +96,25 @@ export class NativeWorkspaceCommandPool {
   }
 
   async prepare(): Promise<void> {
-    const entry = await this.allocate(this.roots.keys().next().value!);
-    try {
-      await entry.sandbox.prepare();
-    } finally {
-      entry.busy = false;
-    }
+    const workspaceIds = [...this.roots.keys()];
+    let next = 0;
+    await Promise.all(
+      Array.from(
+        { length: Math.min(this.capacity, workspaceIds.length) },
+        async () => {
+          for (;;) {
+            const index = next++;
+            if (index >= workspaceIds.length) return;
+            const entry = await this.allocate(workspaceIds[index]!);
+            try {
+              await entry.sandbox.prepare();
+            } finally {
+              entry.busy = false;
+            }
+          }
+        },
+      ),
+    );
   }
 
   async execute(
@@ -126,6 +143,51 @@ export class NativeWorkspaceCommandPool {
           await entry.sandbox.close();
           if (this.entries.get(request.workspaceId) === entry)
             this.entries.delete(request.workspaceId);
+        } catch {
+          /* Retain ownership for subsequent cleanup/shutdown. */
+        }
+      }
+      throw error;
+    } finally {
+      entry.busy = false;
+    }
+  }
+
+  async executeProgrammatic(
+    workspaceId: string,
+    request: BridgeWorkspaceProgrammaticRequest,
+    signal?: AbortSignal,
+  ): Promise<object> {
+    const entry = await this.allocate(workspaceId);
+    let enteredExecutor = false;
+    try {
+      if (signal?.aborted)
+        throw new WorkspaceToolError(
+          'Programmatic execution cancelled before dispatch',
+          'EXECUTION_ABORTED',
+        );
+      enteredExecutor = true;
+      if (!entry.sandbox.executeProgrammatic) {
+        throw new WorkspaceToolError(
+          'Native programmatic executor is unavailable',
+          'COMMAND_UNAVAILABLE',
+        );
+      }
+      return await entry.sandbox.executeProgrammatic(
+        workspaceId,
+        request,
+        signal,
+      );
+    } catch (error) {
+      if (
+        enteredExecutor &&
+        error instanceof WorkspaceToolError &&
+        !error.mutationMayHaveCommitted
+      ) {
+        try {
+          await entry.sandbox.close();
+          if (this.entries.get(workspaceId) === entry)
+            this.entries.delete(workspaceId);
         } catch {
           /* Retain ownership for subsequent cleanup/shutdown. */
         }

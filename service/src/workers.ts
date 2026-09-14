@@ -21,6 +21,7 @@ import {
   validateQueuedExecutionProfile,
   validateQueuedSandboxBackend,
 } from './execution-profile';
+import { BRIDGE_WORKSPACE_PROGRAMMATIC_MAX_FILE_BYTES, programmaticTransferReserveMs } from '../../packages/code/src/protocol';
 
 const { INSTANCE_ID } = env;
 const WORKER_ID = `${INSTANCE_ID}-${process.pid}`;
@@ -91,9 +92,15 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
 
     const delivery = prepareInputDelivery(payload, sandboxPayload);
     const sandboxRequest = buildSandboxExecuteRequest({
+      ...(job.data.workspaceId == null ? {} : { programmaticTransferReserveMs: programmaticTransferReserveMs(env.JOB_TIMEOUT) }),
       payload: delivery.payload,
       egressGrantToken,
       executionManifestClaims,
+      maxOutputFileBytes: Math.min(
+        executionManifestClaims?.max_upload_bytes ?? env.EGRESS_GATEWAY_MAX_FILE_BYTES,
+        env.EGRESS_GATEWAY_MAX_FILE_BYTES,
+        BRIDGE_WORKSPACE_PROGRAMMATIC_MAX_FILE_BYTES,
+      ),
       executionManifestPrivateKey: env.EXECUTION_MANIFEST_PRIVATE_KEY,
       executionManifestSecret: env.EXECUTION_MANIFEST_SECRET,
       executionManifestTtlSeconds: env.EXECUTION_MANIFEST_TTL_SECONDS,
@@ -149,6 +156,7 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
         tenantId: job.data.tenantId,
         canonicalUserId: job.data.canonicalUserId,
         bridgeWorkerId: job.data.bridgeWorkerId,
+        workspaceId: job.data.workspaceId,
         runtimeSessionId: runtimeSession.runtimeSessionId,
         runtimeSessionMode: runtimeSession.runtimeSessionMode,
         /* Stateful backends run this as a commit barrier after user code but
@@ -184,6 +192,9 @@ async function processJobInner(job: t.ExecuteJob): Promise<t.ExecuteResult> {
         : {}),
       stdout,
       stderr,
+      ...(responseData.pending_tool_calls_payload != null
+        ? { pending_tool_calls_payload: responseData.pending_tool_calls_payload }
+        : {}),
     };
 
     if (run) {

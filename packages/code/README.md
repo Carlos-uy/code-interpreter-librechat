@@ -143,13 +143,47 @@ policy. This matches the personal-machine SRT trust model; use the Docker/NsJail
 backend or a dedicated VM boundary when hard teardown of adversarial process
 trees is required.
 
-Linux hosts need Bash at `/bin/bash`, `bubblewrap`, `socat`, and `ripgrep`; macOS uses system
-facilities. Follow SRT's one-time restricted-account setup when using Windows.
+Linux hosts need `bubblewrap`, `socat`, and `ripgrep`; macOS uses system
+facilities. Bash Programmatic Tool Calling additionally requires Bash 5.2 or
+newer and `jq` on `PATH` on macOS, Linux, and WSL2. The worker resolves that
+shell explicitly instead of assuming `/bin/bash`, which remains Bash 3.2 on
+many macOS hosts. Follow SRT's one-time restricted-account setup when using Windows.
 An operator may allow explicit egress destinations with the comma-separated
 `LIBRECHAT_CODE_COMMAND_ALLOWED_DOMAINS` setting. Treat that as a security
 policy: an allowed destination can receive workspace data. The normalized
 allowlist is included in the worker policy digest. Tool approval hooks remain
 the user-facing allow/deny boundary for each invocation.
+
+When Code API negotiates `bash` programmatic execution for a selected
+workspace, the same native SRT executor also supports replay-mode Programmatic
+Tool Calling on macOS, Linux, and WSL2 workers. Native Windows does not
+advertise this Bash capability. The repository remains the command working directory. Generated
+PTC scripts, replay history, skill files, chat attachments, and returned
+artifacts use an owner-only per-execution directory under the worker's private
+SRT scratch root, exposed to code as `LIBRECHAT_CODE_DATA_DIR`. That directory
+is removed after every iteration and is never placed in the repository.
+
+Replay probes run against a disposable copy-on-write snapshot with network and
+socket access denied, including under `trusted-vm`. External effects must not
+repeat while discovering pending tools. Use registered tools for network-dependent
+replay control flow; the final commit pass runs once under the configured policy.
+Each probe's SRT proxy session is revoked before restoring the commit policy;
+per-command network overrides alone do not restrict SRT's session-level proxies.
+Probe failures do not quarantine the real workspace. Once the commit pass starts,
+its fence remains until result restoration succeeds; uncertain finalization
+quarantines only that workspace.
+
+Reference inputs and artifact outputs travel only through the configured
+`LIBRECHAT_CODE_FILE_RELAY_UPSTREAM`, using Code API's execution-scoped opaque
+egress grant. The worker rejects redirects and bounds each transfer to 10 MiB,
+each execution to 100 files and 100 MiB total, and transfer concurrency to four.
+Caller inputs are limited to 98 files, reserving two for the script and replay
+history. Code API reserves one third of the job budget for all transfer batches
+and negotiates each transfer's deadline before signing the request.
+Its parent process keeps a 64-entry/32-MiB LRU input cache keyed by a stable,
+Code-API-authorized digest; sandboxed commands cannot read that cache. Requests
+against one workspace remain serialized, while negotiated lease slots allow
+different registered roots to execute concurrently.
 
 The native sandbox preserves standard `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
 and `NO_PROXY` names (including lowercase forms), plus Windows process and profile

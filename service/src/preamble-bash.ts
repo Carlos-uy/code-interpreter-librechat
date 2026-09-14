@@ -1,8 +1,5 @@
 import type { LCTool } from './preamble';
-import {
-  buildScopedSentinel,
-  PTC_HISTORY_SANDBOX_PATH,
-} from './ptc-constants';
+import { buildScopedSentinel, PTC_HISTORY_SANDBOX_PATH } from './ptc-constants';
 
 export interface BashReplayPreambleConfig {
   executionId: string;
@@ -42,12 +39,55 @@ export class BashToolNameCollisionError extends Error {
 }
 
 const BASH_RESERVED = new Set([
-  'if', 'then', 'else', 'elif', 'fi', 'case', 'esac', 'for', 'select',
-  'while', 'until', 'do', 'done', 'in', 'function', 'time', 'coproc',
-  'return', 'exit', 'break', 'continue', 'shift', 'export', 'readonly',
-  'local', 'declare', 'typeset', 'unset', 'alias', 'unalias', 'source',
-  'echo', 'printf', 'read', 'cd', 'pwd', 'kill', 'trap', 'wait', 'eval',
-  'exec', 'jobs', 'bg', 'fg', 'set', 'let', 'test', 'true', 'false',
+    'if',
+    'then',
+    'else',
+    'elif',
+    'fi',
+    'case',
+    'esac',
+    'for',
+    'select',
+    'while',
+    'until',
+    'do',
+    'done',
+    'in',
+    'function',
+    'time',
+    'coproc',
+    'return',
+    'exit',
+    'break',
+    'continue',
+    'shift',
+    'export',
+    'readonly',
+    'local',
+    'declare',
+    'typeset',
+    'unset',
+    'alias',
+    'unalias',
+    'source',
+    'echo',
+    'printf',
+    'read',
+    'cd',
+    'pwd',
+    'kill',
+    'trap',
+    'wait',
+    'eval',
+    'exec',
+    'jobs',
+    'bg',
+    'fg',
+    'set',
+    'let',
+    'test',
+    'true',
+    'false',
 ]);
 
 function normalizeBashFunctionName(name: string): string {
@@ -60,10 +100,7 @@ function normalizeBashFunctionName(name: string): string {
    * the end-of-preamble `readonly -f` lockdown runs. Compared case-
    * insensitively because the `_PTC_` prefix is used for variables and
    * `_ptc_` for functions, and both live in the same identifier space. */
-  if (
-    BASH_RESERVED.has(normalized) ||
-    /^_ptc_/i.test(normalized)
-  ) {
+    if (BASH_RESERVED.has(normalized) || /^_ptc_/i.test(normalized)) {
     normalized = normalized + '_tool';
   }
   if (normalized === '') normalized = 'tool';
@@ -95,9 +132,12 @@ function escapeForBashEre(s: string): string {
  * Users capture results via command substitution; input is passed as a single
  * JSON object string argument (validated by jq).
  */
-export function generateBashReplayPreamble(config: BashReplayPreambleConfig): string {
+export function generateBashReplayPreamble(
+    config: BashReplayPreambleConfig,
+): string {
   const { executionId, tools } = config;
-  const { start: scopedStart, end: scopedEnd } = buildScopedSentinel(executionId);
+    const { start: scopedStart, end: scopedEnd } =
+        buildScopedSentinel(executionId);
 
   let preamble = `#!/bin/bash
 # ============================================================================
@@ -109,20 +149,25 @@ _PTC_EXECUTION_ID="${executionId}"
 _PTC_SENTINEL_START="${scopedStart}"
 _PTC_SENTINEL_END="${scopedEnd}"
 _PTC_HISTORY_PATH="\${PTC_HISTORY_PATH:-${PTC_HISTORY_SANDBOX_PATH}}"
-_PTC_PENDING_FILE="$(mktemp -t _ptc_pending.XXXXXX 2>/dev/null || mktemp /tmp/_ptc_pending.XXXXXX)"
-_PTC_ERROR_FILE="$(mktemp -t _ptc_error.XXXXXX 2>/dev/null || mktemp /tmp/_ptc_error.XXXXXX)"
-_PTC_CONSUMED_FILE="$(mktemp -t _ptc_consumed.XXXXXX 2>/dev/null || mktemp /tmp/_ptc_consumed.XXXXXX)"
-_PTC_SAW_BARE_TOOL_FILE="$(mktemp -t _ptc_saw_tool.XXXXXX 2>/dev/null || mktemp /tmp/_ptc_saw_tool.XXXXXX)"
-_PTC_PRE_TOOL_JOBS_FILE="$(mktemp -t _ptc_pre_tool_jobs.XXXXXX 2>/dev/null || mktemp /tmp/_ptc_pre_tool_jobs.XXXXXX)"
-_PTC_PRE_TOOL_JOBS_READY_FILE="$(mktemp -t _ptc_pre_tool_jobs_ready.XXXXXX 2>/dev/null || mktemp /tmp/_ptc_pre_tool_jobs_ready.XXXXXX)"
-_PTC_TOOL_JOBS_FILE="$(mktemp -t _ptc_tool_jobs.XXXXXX 2>/dev/null || mktemp /tmp/_ptc_tool_jobs.XXXXXX)"
-_PTC_WAIT_RAN_FILE="$(mktemp -t _ptc_wait_ran.XXXXXX 2>/dev/null || mktemp /tmp/_ptc_wait_ran.XXXXXX)"
-_PTC_SUPPRESS_SUBSHELL_TOOL_FILE="$(mktemp -t _ptc_suppress_subshell_tool.XXXXXX 2>/dev/null || mktemp /tmp/_ptc_suppress_subshell_tool.XXXXXX)"
-_PTC_SUPPRESS_SUBSHELL_TOOL_CLEAR_FILE="$(mktemp -t _ptc_suppress_subshell_tool_clear.XXXXXX 2>/dev/null || mktemp /tmp/_ptc_suppress_subshell_tool_clear.XXXXXX)"
+_PTC_CONTROL_PATH="\${LIBRECHAT_CODE_CONTROL_PATH:-}"
+_PTC_RUNTIME_DIR="\${TMPDIR:-/tmp}"
+_ptc_mktemp() {
+    mktemp "\${_PTC_RUNTIME_DIR%/}/$1.XXXXXX"
+}
+_PTC_PENDING_FILE="$(_ptc_mktemp _ptc_pending)"
+_PTC_ERROR_FILE="$(_ptc_mktemp _ptc_error)"
+_PTC_CONSUMED_FILE="$(_ptc_mktemp _ptc_consumed)"
+_PTC_SAW_BARE_TOOL_FILE="$(_ptc_mktemp _ptc_saw_tool)"
+_PTC_PRE_TOOL_JOBS_FILE="$(_ptc_mktemp _ptc_pre_tool_jobs)"
+_PTC_PRE_TOOL_JOBS_READY_FILE="$(_ptc_mktemp _ptc_pre_tool_jobs_ready)"
+_PTC_TOOL_JOBS_FILE="$(_ptc_mktemp _ptc_tool_jobs)"
+_PTC_WAIT_RAN_FILE="$(_ptc_mktemp _ptc_wait_ran)"
+_PTC_SUPPRESS_SUBSHELL_TOOL_FILE="$(_ptc_mktemp _ptc_suppress_subshell_tool)"
+_PTC_SUPPRESS_SUBSHELL_TOOL_CLEAR_FILE="$(_ptc_mktemp _ptc_suppress_subshell_tool_clear)"
 # Counter must persist across subshells (command substitution) so call_ids
 # stay deterministic across cached/uncached calls. Bash variables set in a
 # subshell don't propagate back, so we use a file.
-_PTC_COUNTER_FILE="$(mktemp -t _ptc_counter.XXXXXX 2>/dev/null || mktemp /tmp/_ptc_counter.XXXXXX)"
+_PTC_COUNTER_FILE="$(_ptc_mktemp _ptc_counter)"
 _PTC_LOCK_DIR="\${_PTC_PENDING_FILE}.lock"
 printf '0' > "$_PTC_COUNTER_FILE"
 : > "$_PTC_CONSUMED_FILE"
@@ -243,7 +288,7 @@ _ptc_prune_finished_tool_jobs() {
         return 0
     fi
     local _ptc_tmp_file
-    _ptc_tmp_file="$(mktemp -t _ptc_tool_jobs_live.XXXXXX 2>/dev/null || mktemp /tmp/_ptc_tool_jobs_live.XXXXXX)"
+    _ptc_tmp_file="$(_ptc_mktemp _ptc_tool_jobs_live)"
     while IFS= read -r _ptc_pid; do
         [ -n "$_ptc_pid" ] || continue
         if kill -0 "$_ptc_pid" 2>/dev/null; then
@@ -329,6 +374,17 @@ _ptc_maybe_emit_pending() {
         _ptc_cleanup_tempfiles
         trap - DEBUG EXIT
         exit 1
+    fi
+    # Native BYOM workers use this private execution-scoped control file so a
+    # large stdout stream cannot truncate away the replay frame. Other
+    # backends continue to consume the stdout sentinel below.
+    if [ -n "$_PTC_CONTROL_PATH" ]; then
+        printf '%s' "$_ptc_payload" > "$_PTC_CONTROL_PATH" || {
+            printf 'failed to persist pending PTC tool calls\n' >&2
+            _ptc_cleanup_tempfiles
+            trap - DEBUG EXIT
+            exit 1
+        }
     fi
     if [ "\${BASH_SUBSHELL:-0}" -eq 1 ]; then
         trap - DEBUG EXIT
@@ -512,7 +568,7 @@ _ptc_call_tool() {
 
     # Large input can exceed ARG_MAX via --argjson; write once, reuse path below.
     local _ptc_input_tmp
-    _ptc_input_tmp="$(mktemp -t _ptc_input.XXXXXX 2>/dev/null || mktemp /tmp/_ptc_input.XXXXXX)"
+    _ptc_input_tmp="$(_ptc_mktemp _ptc_input)"
     printf '%s' "$_ptc_input" > "$_ptc_input_tmp"
 
     local _ptc_matches
@@ -668,8 +724,12 @@ exit $_ptc_user_exit_code
 
 function generateBashToolStub(tool: LCTool): string {
   const fnName = normalizeBashFunctionName(tool.name);
-  const desc = (tool.description ?? '').split('\n').map(l => `# ${l}`).join('\n');
-  const nameComment = fnName !== tool.name ? `# Original tool name: ${tool.name}\n` : '';
+    const desc = (tool.description ?? '')
+        .split('\n')
+        .map(l => `# ${l}`)
+        .join('\n');
+    const nameComment =
+        fnName !== tool.name ? `# Original tool name: ${tool.name}\n` : '';
   const escapedToolName = escapeForBashDoubleQuote(tool.name);
   return `${nameComment}${desc ? desc + '\n' : ''}${fnName}() {
     local _default_input='{}'
@@ -683,7 +743,8 @@ function generateBashToolStub(tool: LCTool): string {
 }
 
 function generateBashPendingDeferHelper(tools: readonly LCTool[]): string {
-  const toolNamesPattern = tools
+    const toolNamesPattern =
+        tools
     .map(tool => normalizeBashFunctionName(tool.name))
     .map(escapeForBashEre)
     .join('|') || 'a^';
