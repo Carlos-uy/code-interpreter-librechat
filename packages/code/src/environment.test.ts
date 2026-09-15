@@ -193,6 +193,68 @@ test('environment roots resolve relative to the definition and fingerprints cove
     );
 });
 
+test('accepts an own root through trusted external symlinks without allowing other root identities', async t => {
+    const directory = await realpath(await mkdtemp(join(tmpdir(), 'code-env-own-alias-')));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const root = join(directory, 'project');
+    await mkdir(root);
+    const alias = join(directory, 'alias');
+    await symlink(root, alias);
+    await symlink(alias, join(directory, 'nested-alias'));
+    const path = join(directory, 'environment.yaml');
+    for (const selected of [alias, join(directory, 'nested-alias')]) {
+        await writeFile(path, `name: app\nroot: ${selected}\n`);
+        const loaded = await loadCodeEnvironment(path);
+        assert.equal(loaded.definition.root, root);
+        await assertEnvironmentDefinitionsOutsideRoots([loaded], [{ id: 'app', root }]);
+        await assert.rejects(
+            assertEnvironmentDefinitionsOutsideRoots([loaded], [{ id: 'other', root }]),
+            /root traversal|mount alias/,
+        );
+    }
+});
+
+test('rejects own-root links hidden by parent aliases or filesystem casing', async t => {
+    const directory = await realpath(await mkdtemp(join(tmpdir(), 'code-env-parent-alias-')));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const root = join(directory, 'Project');
+    await mkdir(root);
+    await symlink(root, join(root, 'self'));
+    const outside = join(directory, 'outside');
+    await mkdir(outside);
+    await symlink(root, join(outside, 'back'));
+    await symlink(outside, join(root, 'pivot'));
+    const alias = join(directory, 'parent-alias');
+    await symlink(root, alias);
+    const path = join(directory, 'environment.yaml');
+    const selectedRoots = [join(alias, 'self'), join(alias, 'pivot', 'back')];
+    try {
+        if (await realpath(join(directory, 'project')) === root) {
+            selectedRoots.push(join(directory, 'project', 'self'));
+            selectedRoots.push(join(directory, 'project', 'pivot', 'back'));
+        }
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    for (const selected of selectedRoots) {
+        await writeFile(path, `name: app\nroot: ${selected}\n`);
+        const loaded = await loadCodeEnvironment(path);
+        await assert.rejects(
+            assertEnvironmentDefinitionsOutsideRoots([loaded], [{ id: 'app', root }]),
+            /root traversal|mount alias/,
+        );
+    }
+    const definition = join(outside, 'environment.yaml');
+    await writeFile(definition, `name: app\nroot: ${root}\n`);
+    for (const selected of selectedRoots.filter(path => path.endsWith('/back'))) {
+        const loaded = await loadCodeEnvironment(selected.replace(/back$/, 'environment.yaml'));
+        await assert.rejects(
+            assertEnvironmentDefinitionsOutsideRoots([loaded], [{ id: 'app', root }]),
+            /outside|mount alias/,
+        );
+    }
+});
+
 test('rejects a trusted definition with an in-workspace hard link', async t => {
     const directory = await mkdtemp(join(tmpdir(), 'code-env-hardlink-'));
     t.after(() => rm(directory, { recursive: true, force: true }));
