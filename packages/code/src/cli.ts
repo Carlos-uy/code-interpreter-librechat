@@ -1012,12 +1012,12 @@ async function run(
                 },
                 controller.signal,
             );
-            await guard.clear('setup');
             if (result.exitCode !== 0 || result.timedOut) {
                 throw new Error(
-                    `Environment ${id} setup failed; inspect the setup command before restarting`,
+                    `Environment ${id} setup failed; inspect the workspace and use clear-workspace-quarantine with its root and workspace ID before restarting`,
                 );
             }
+            await guard.clear('setup');
             process.stdout.write(
                 `librechat-code: environment ${id} prepared\n`,
             );
