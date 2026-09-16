@@ -1,10 +1,11 @@
-import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { constants } from 'node:fs';
-import { link, lstat, open, realpath, rename, stat, unlink } from 'node:fs/promises';
+import { link, lstat, open, realpath, rename, stat, unlink, spawn, withWorkspaceRoot, WorkspaceRootAccessError } from './root-access.js';
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 
 import type { FileHandle } from 'node:fs/promises';
+import { matchesWorkspaceRoot } from './root-identity.js';
+import type { WorkspaceRootIdentity } from './root-identity.js';
 
 import {
   BRIDGE_PROTOCOL_VERSION,
@@ -67,6 +68,7 @@ export type {
 };
 
 export interface LocalWorkspaceConfig {
+  identity?: WorkspaceRootIdentity;
   id: string;
   name?: string;
   root: string;
@@ -336,6 +338,7 @@ async function readConfinedFile(
 }
 
 interface WorkspaceRoot {
+  identity?: WorkspaceRootIdentity;
   root: string;
   writable: boolean;
 }
@@ -1435,8 +1438,8 @@ export class LocalWorkspaceTools implements WorkspaceToolExecutor {
 
   async instructionDescriptors() {
     if (!this.repositoryInstructions) return undefined;
-    const entries = await Promise.all([...this.roots].map(async ([id, { root }]) => {
-      const snapshot = await readRepositoryInstructions(root);
+    const entries = await Promise.all([...this.roots].map(async ([id, { root, identity }]) => {
+      const snapshot = await withWorkspaceRoot(root, identity, () => readRepositoryInstructions(root));
       return [id, snapshot ? [snapshot.descriptor] : []] as const;
     }));
     return new Map(entries);
@@ -1508,6 +1511,8 @@ export class LocalWorkspaceTools implements WorkspaceToolExecutor {
       let canonicalRoot: string;
       try {
         canonicalRoot = await realpath(workspace.root);
+        if (workspace.identity && !await matchesWorkspaceRoot(canonicalRoot, workspace.identity)) throw new Error();
+        await withWorkspaceRoot(canonicalRoot, workspace.identity, async () => undefined);
         if (!(await stat(canonicalRoot)).isDirectory()) throw new Error();
       } catch {
         throw new WorkspaceToolError(
@@ -1516,6 +1521,7 @@ export class LocalWorkspaceTools implements WorkspaceToolExecutor {
         );
       }
       roots.set(workspace.id, {
+        identity: workspace.identity,
         root: canonicalRoot,
         writable: workspace.writable === true,
       });
@@ -1534,6 +1540,20 @@ export class LocalWorkspaceTools implements WorkspaceToolExecutor {
   }
 
   async execute(
+    request: WorkspaceToolRequest,
+    signal?: AbortSignal,
+  ): Promise<WorkspaceToolResult> {
+    const workspace = this.roots.get(request?.workspaceId);
+    if (!workspace?.identity) return this.executeBound(request, signal);
+    try {
+      return await withWorkspaceRoot(workspace.root, workspace.identity, () => this.executeBound(request, signal));
+    } catch (error) {
+      if (error instanceof WorkspaceRootAccessError) throw new WorkspaceToolError(error.message, 'REGISTRATION_INVALID');
+      throw error;
+    }
+  }
+
+  private async executeBound(
     request: WorkspaceToolRequest,
     signal?: AbortSignal,
   ): Promise<WorkspaceToolResult> {
