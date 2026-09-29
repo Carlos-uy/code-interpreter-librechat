@@ -791,6 +791,57 @@ Legacy requests without a conversation identity continue to use the selected
 source root. Older Code API deployments do not negotiate the capability, so the
 worker omits it until every request path understands the isolation boundary.
 
+#### Linked worktree lanes
+
+Agents that keep one checkout and give each task its own linked worktree
+(`git worktree add .worktrees/<task>`) can run those tasks concurrently:
+
+```sh
+librechat-code run \
+  --worker-dir /projects/LibreChat \
+  --workspace-lease-slots 4 \
+  --linked-worktree-lanes \
+  --allow-workspace-writes \
+  --allow-workspace-commands
+```
+
+`LIBRECHAT_CODE_LINKED_WORKTREE_LANES=true` is the environment equivalent. The
+worker then advertises `workspaceScopes: ['git_linked_worktree']` for each
+registered root, and a request that names `worktree: <name>` runs in its own
+lane at `<root>/.worktrees/<name>`, with `cwd` and file paths relative to that
+worktree. Sibling lanes run concurrently up to the negotiated slot count. A
+lane and its checkout never run at the same time: requests without a
+`worktree`, including `git worktree add` or `remove` run at the root, wait for
+every lane beneath the checkout, and a waiting root request holds back newer
+lanes so it cannot be starved.
+
+Before admission the worker verifies, without running Git, that the directory
+is a real linked worktree of that checkout: no symlinks on the path, a `.git`
+file pointing at `<root>/.git/worktrees/<name>`, and metadata whose `commondir`
+and `gitdir` point back. Shared Git storage paths granted for writes must be
+real directories, not symlinks into sibling metadata; optional log and LFS
+paths may be absent. A lane's sandbox can write only its worktree, the
+shared object and ref storage (`.git/objects`, `.git/refs`, `.git/logs/refs`,
+`.git/lfs`) and its own `.git/worktrees/<name>` metadata. Everything else in
+`.git` stays read-only: configuration, hooks and `info`, the checkout's own
+`HEAD`, index and merge or rebase state, and sibling metadata. Automatic `gc`
+and maintenance are disabled, and `git gc` itself cannot run in a lane (it
+needs to write `.git/gc.pid` and `packed-refs`); run storage maintenance from
+the checkout. Explicit `git prune --expire now`, `git repack -ad`, or LFS
+pruning can still delete objects another lane is writing; the sandbox does
+**not** prevent this race. Do not enable lanes for agents that run destructive
+maintenance until those commands are blocked or serialized. Deleting a branch
+or tag also needs the checkout, because Git locks `packed-refs` for every ref
+deletion. Each lane has its own durable quarantine guard. A lane
+cannot start while its checkout is quarantined, and a checkout cannot start
+while any lane beneath it is.
+
+Lanes require native-srt commands and at least two lease slots, and cannot yet
+be combined with conversation worktrees. Code API must advertise
+`supportedWorkspaceScopes`; older deployments do not, and the worker omits the
+scope for them. Deploy consumers that read worker status (such as LibreChat)
+with support for `workspaceScopes` before enabling lanes on a worker.
+
 On an updated Code API, admission waits up to 30 seconds without the
 `X-LibreChat-Workspace-Queue-Wait-Ms` request header. A caller may advertise a
 positive integer millisecond allowance up to five minutes, capped by any server
@@ -849,6 +900,11 @@ To recover a quarantined native root:
 2. Run `librechat-code clear-workspace-quarantine --worker-dir /projects/second --workspace-id second` using the same deployment/identity configuration.
 3. Run the normal worker command with all its root/slot options plus `--reset-workspace-quarantine second`. This verifies the local guard is cleared, resets the server fence, then exits.
 4. Restart the normal worker command without the reset option.
+
+A linked-worktree lane keeps its own guard and fence. Inspect or restore
+`<root>/.worktrees/<name>`, clear its guard with
+`--worker-dir <root>/.worktrees/<name>`, then add
+`--reset-workspace-worktree <name>` to the reset command in step 3.
 
 The workspace selector in LibreChat must preserve these registered IDs. Adding
 roots here does not grant a principal access or change an agent's selected root.

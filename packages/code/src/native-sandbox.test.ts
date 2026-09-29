@@ -1598,3 +1598,64 @@ test('cleans allocated command state exactly once on every execution exit', asyn
     }
   }
 });
+
+test('a linked worktree lane may write only shared Git storage and its own metadata', async t => {
+  const checkoutRoot = await realpath(await mkdtemp(join(tmpdir(), 'librechat-code-lane-')));
+  t.after(() => rm(checkoutRoot, { recursive: true, force: true }));
+  const commonGitDir = join(checkoutRoot, '.git');
+  const lane = join(checkoutRoot, '.worktrees', 'task-a');
+  const writableGitPaths = [
+    join(commonGitDir, 'objects'),
+    join(commonGitDir, 'refs'),
+    join(commonGitDir, 'worktrees', 'task-a'),
+  ];
+  await Promise.all(
+    [lane, ...writableGitPaths].map(path => mkdir(path, { recursive: true })),
+  );
+  const prepare = async (paths: string[]) => {
+    const fake = fakeManager();
+    const sandbox = new NativeSrtWorkspaceCommandSandbox({
+      workspaceRoot: lane,
+      linkedWorktree: { checkoutRoot, commonGitDir, writableGitPaths: paths },
+      environment: { PATH: '/usr/bin' },
+      manager: fake.manager,
+    });
+    t.after(() => sandbox.close());
+    await sandbox.prepare();
+    return fake.config!;
+  };
+
+  const config = await prepare(writableGitPaths);
+  assert.deepEqual(config.filesystem.allowWrite.slice(0, 4), [lane, ...writableGitPaths]);
+  assert.ok(!config.filesystem.allowWrite.includes(commonGitDir));
+  assert.ok(config.filesystem.allowRead?.includes(commonGitDir));
+
+  const probed = fakeManager();
+  const prober = new NativeSrtWorkspaceCommandSandbox({
+    workspaceRoot: lane,
+    linkedWorktree: { checkoutRoot, commonGitDir, writableGitPaths },
+    environment: { PATH: '/usr/bin' },
+    manager: probed.manager,
+  });
+  t.after(() => prober.close());
+  const dataDirectory = await prober.createExecutionDirectory();
+  await prober.executeProgrammatic(request, dataDirectory, undefined, { probe: true });
+  assert.ok(probed.customConfigSeenDuringWrap?.filesystem?.allowRead?.includes(commonGitDir));
+  assert.ok(!probed.customConfigSeenDuringWrap?.filesystem?.allowWrite?.includes(commonGitDir));
+
+  await assert.rejects(
+    prepare([commonGitDir]),
+    (error: unknown) =>
+      error instanceof WorkspaceToolError && error.code === 'REGISTRATION_INVALID',
+  );
+
+  const siblingMetadata = join(commonGitDir, 'worktrees', 'task-b');
+  await mkdir(siblingMetadata, { recursive: true });
+  await rm(join(commonGitDir, 'objects'), { recursive: true });
+  await symlink(siblingMetadata, join(commonGitDir, 'objects'));
+  await assert.rejects(
+    prepare(writableGitPaths),
+    (error: unknown) =>
+      error instanceof WorkspaceToolError && error.code === 'REGISTRATION_INVALID',
+  );
+});
