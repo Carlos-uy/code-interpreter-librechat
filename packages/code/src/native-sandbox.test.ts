@@ -1612,13 +1612,14 @@ test('a linked worktree lane may write only shared Git storage and its own metad
   await Promise.all(
     [lane, ...writableGitPaths].map(path => mkdir(path, { recursive: true })),
   );
-  const prepare = async (paths: string[]) => {
+  const prepare = async (paths: string[], platform: NodeJS.Platform = 'linux') => {
     const fake = fakeManager();
     const sandbox = new NativeSrtWorkspaceCommandSandbox({
       workspaceRoot: lane,
       linkedWorktree: { checkoutRoot, commonGitDir, writableGitPaths: paths },
       environment: { PATH: '/usr/bin' },
       manager: fake.manager,
+      platform,
     });
     t.after(() => sandbox.close());
     await sandbox.prepare();
@@ -1629,6 +1630,16 @@ test('a linked worktree lane may write only shared Git storage and its own metad
   assert.deepEqual(config.filesystem.allowWrite.slice(0, 4), [lane, ...writableGitPaths]);
   assert.ok(!config.filesystem.allowWrite.includes(commonGitDir));
   assert.ok(config.filesystem.allowRead?.includes(commonGitDir));
+  // Deeper read denies make SRT re-bind each writable Git directory after the
+  // read-only bind of the common directory (Linux tmpfs re-binding order).
+  for (const path of writableGitPaths) {
+    assert.ok(config.filesystem.denyRead.includes(path), path);
+  }
+  assert.ok(!config.filesystem.denyRead.includes(join(commonGitDir, 'lfs')));
+  const darwin = await prepare(writableGitPaths, 'darwin');
+  for (const path of writableGitPaths) {
+    assert.ok(!darwin.filesystem.denyRead.includes(path), path);
+  }
   const gitGuard = config.filesystem.allowRead?.find(path => path.includes('librechat-code-git-'));
   assert.ok(gitGuard, 'lane Git guard must be readable');
   assert.ok(!config.filesystem.allowWrite.includes(gitGuard));

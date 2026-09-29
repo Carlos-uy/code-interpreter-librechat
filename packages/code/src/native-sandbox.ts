@@ -481,6 +481,25 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
       );
     }
     const laneGitPaths = commonGitDir ? [commonGitDir] : [];
+    /**
+     * On Linux, SRT hides a read-denied directory (such as the worker home) under a
+     * tmpfs and then re-binds writes before reads, so the read-only bind of the whole
+     * common Git directory would mask its writable descendants. SRT processes read
+     * denies shallow-first, re-binding each one's writes on top, so listing every
+     * existing writable Git directory as a deeper deny restores its write bind after
+     * the ancestor read bind. The common directory stays a live, read-only host
+     * directory: nothing can be created at its top level.
+     */
+    const laneWriteRebinds =
+      this.platform === 'linux'
+        ? (
+            await Promise.all(
+              writableGitPaths.map(async path =>
+                (await stat(path).catch(() => undefined))?.isDirectory() ? path : undefined,
+              ),
+            )
+          ).filter((path): path is string => path != null)
+        : [];
     const canonicalScratchDirectory =
       await this.createScratchDirectory(sharedScratchPaths);
     if (
@@ -519,6 +538,7 @@ export class NativeSrtWorkspaceCommandSandbox implements WorkspaceCommandSandbox
                     ...sharedScratchPaths.filter(path =>
             deniedInheritedWritablePaths.includes(path),
           ),
+          ...laneWriteRebinds,
         ],
         allowRead: [
           root,
