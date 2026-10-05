@@ -18,6 +18,7 @@ import { signBridgeRequest } from './identity.js';
 import { isWorkspaceToolRequest, WorkspaceToolError } from './workspace.js';
 
 import type {
+  WorkspaceCommandResultFeature,
   BridgeAssignment,
   BridgeLeaseResponse,
   BridgeSandboxRequest,
@@ -218,6 +219,11 @@ function workspaceCapabilitiesMatch(
       (feature, index) => feature === executor.listFileFeatures?.[index],
     ) ??
       executor.listFileFeatures == null) &&
+    advertised.commandResultFeatures?.length === executor.commandResultFeatures?.length &&
+    (advertised.commandResultFeatures?.every(
+      (feature, index) => feature === executor.commandResultFeatures?.[index],
+    ) ??
+      executor.commandResultFeatures == null) &&
     advertised.programmaticLanguages?.length ===
       executor.programmaticLanguages?.length &&
     (advertised.programmaticLanguages?.every(
@@ -314,6 +320,7 @@ function registrationCompatibleCapabilities(
     editFileModes: _editFileModes,
     editFileFeatures: _editFileFeatures,
     listFileFeatures: _listFileFeatures,
+    commandResultFeatures: _commandResultFeatures,
     programmaticLanguages: _programmaticLanguages,
     ...compatibleWorkspaceTools
   } = workspaceTools;
@@ -409,6 +416,9 @@ function supportedWorkspaceCapabilities(
   const listFileFeatures = desired.listFileFeatures?.filter((feature) =>
     registration.supportedWorkspaceListFileFeatures?.includes(feature),
   );
+  const commandResultFeatures = desired.commandResultFeatures?.filter((feature) =>
+    registration.supportedWorkspaceCommandResultFeatures?.includes(feature),
+  );
   const programmaticLanguages = desired.programmaticLanguages?.filter(
     (language) =>
       registration.supportedWorkspaceProgrammaticLanguages?.includes(language),
@@ -418,6 +428,7 @@ function supportedWorkspaceCapabilities(
     editFileModes: _editFileModes,
     editFileFeatures: _editFileFeatures,
     listFileFeatures: _listFileFeatures,
+    commandResultFeatures: _commandResultFeatures,
     programmaticLanguages: _programmaticLanguages,
     ...compatibleDesired
   } = desired;
@@ -438,6 +449,9 @@ function supportedWorkspaceCapabilities(
         : {}),
       ...(operations.includes('list_files') && listFileFeatures?.length
         ? { listFileFeatures }
+        : {}),
+      ...(operations.includes('execute_command') && commandResultFeatures?.length
+        ? { commandResultFeatures }
         : {}),
       ...(operations.includes('execute_command') &&
       programmaticLanguages?.length
@@ -468,6 +482,11 @@ export class BridgeWorker {
   private instructionMetadataSupported = true;
   /** Added error codes the current Code API registration accepts in settlements. */
   private settlementErrorCodes: ReadonlySet<WorkspaceToolErrorCode> = new Set();
+  /** Whether the registration that is actually active advertised this command result feature. */
+  commandResultFeatureActive(feature: WorkspaceCommandResultFeature): boolean {
+    return this.activeCapabilities.workspaceTools?.commandResultFeatures?.includes(feature) === true;
+  }
+
   private registrationTtlMs = DEFAULT_REGISTRATION_TTL_MS;
   private lastRegisteredAtMs = 0;
   private maintenanceOnly = false;
@@ -1854,6 +1873,7 @@ export class BridgeWorker {
         payload = await this.options.workspaceTools.execute(
           workspaceRequest,
           executionController.signal,
+          { deadlineAtMs: localDeadlineAtMs },
         );
         if (
           workspaceRequest.operation === 'list_files' &&
@@ -1862,6 +1882,14 @@ export class BridgeWorker {
         ) {
           const { nextAfterPath: _nextAfterPath, ...compatiblePayload } =
             payload;
+          payload = compatiblePayload;
+        }
+        if (
+          workspaceRequest.operation === 'execute_command' &&
+          !advertised.commandResultFeatures?.includes('lane_git') &&
+          'laneGit' in payload
+        ) {
+          const { laneGit: _laneGit, ...compatiblePayload } = payload;
           payload = compatiblePayload;
         }
         workspaceMutationApplied = isMutation;

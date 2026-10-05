@@ -21,6 +21,8 @@ import {
     workspaceIsolationParent,
 } from '../../../packages/code/src/protocol';
 import type { BridgeWorkerBinding } from './pairing';
+import logger from '../logger';
+import { hasLaneGit, laneGitPolicy } from './lane-git';
 import { BridgeAdmissionQueue, durableAdmissionFence } from './admission';
 import { BridgeWorkspaceSlots } from './slots';
 import type { StoredWorkspaceRequest } from '../workspace-tools/requests';
@@ -383,6 +385,12 @@ function assignmentKey(assignmentId: string): string {
   return `${PREFIX}:assignment:${assignmentId}`;
 }
 
+function withoutLaneGit(settlement: AnyCodeBridgeSettlement): AnyCodeBridgeSettlement {
+  if (settlement.status !== 'fulfilled') return settlement;
+  const { laneGit: _laneGit, ...result } = settlement.result as unknown as Record<string, unknown>;
+  return { ...settlement, result } as AnyCodeBridgeSettlement;
+}
+
 function settlementKey(assignmentId: string): string {
   return `${PREFIX}:assignment:${assignmentId}:settlement`;
 }
@@ -472,6 +480,8 @@ export class RedisBridgeStore {
     private readonly workerTtlSeconds = DEFAULT_WORKER_TTL_SECONDS,
     private readonly redisCommandTimeoutMs = DEFAULT_REDIS_COMMAND_TIMEOUT_MS,
     private readonly maxWorkspaceLeaseSlots = 1,
+    /** Accept `laneGit` on command results and offer `lane_git` at registration. Off by default. */
+    public readonly laneGitEnabled = false,
   ) {
     if (
       !Number.isSafeInteger(maxWorkspaceLeaseSlots) ||
@@ -1791,12 +1801,25 @@ export class RedisBridgeStore {
       );
       return;
     }
-    const serializedSettlement = JSON.stringify(settlement);
+    let serializedSettlement = JSON.stringify(settlement);
     const existingSettlement = await this.leaseCommand(
       this.redis.get(settlementKey(assignmentId)),
       signal,
       'Bridge settlement existing read',
     );
+    if (
+      existingSettlement != null &&
+      existingSettlement !== serializedSettlement &&
+      hasLaneGit(settlement.status === 'fulfilled' ? settlement.result : undefined)
+    ) {
+      // A retry of a committed settlement must stay recognizable whichever way this replica's
+      // lane Git setting differs from the replica that committed it.
+      const stripped = withoutLaneGit(settlement);
+      if (existingSettlement === JSON.stringify(stripped)) {
+        settlement = stripped;
+        serializedSettlement = existingSettlement;
+      }
+    }
     if (
       existingSettlement != null &&
       existingSettlement !== serializedSettlement
@@ -1855,6 +1878,13 @@ export class RedisBridgeStore {
         'ASSIGNMENT_EXPIRED',
         'Bridge assignment has expired',
       );
+    }
+    // Uses the assignment and registration already read above: no extra round trips on the
+    // settlement path, which has only a short grace after the command ran.
+    const sanitized = this.sanitizeLaneGit(assignmentId, settlement, assignment, registration);
+    if (sanitized !== settlement) {
+      settlement = sanitized;
+      serializedSettlement = JSON.stringify(settlement);
     }
     const ttlSeconds = assignmentOutcomeTtlSeconds(assignment);
     const settlementKeys = [
@@ -1962,6 +1992,38 @@ export class RedisBridgeStore {
       await this.commitPendingWorkspace(assignment, settlement);
       await this.cleanupWithRetry(workerId, assignmentId, assignment);
     }
+  }
+
+  /**
+   * Validate the optional `laneGit` of a fulfilled execute_command settlement before it is
+   * stored or forwarded. An invalid, unexpected or unadvertised value is dropped, never an
+   * error: the command's own result must still reach the caller. Pure over records the caller
+   * already read, so it adds no Redis round trips.
+   */
+  private sanitizeLaneGit(
+    assignmentId: string,
+    settlement: AnyCodeBridgeSettlement,
+    assignment: StoredAssignment,
+    registration: RegisteredBridgeWorker | undefined,
+  ): AnyCodeBridgeSettlement {
+    if (
+      settlement.status !== 'fulfilled' ||
+      !hasLaneGit(settlement.result) ||
+      assignment.executionKind !== 'workspace_tool' ||
+      (assignment.request as WorkspaceToolRequest).operation !== 'execute_command'
+    ) {
+      return settlement;
+    }
+    const { dropped } = laneGitPolicy({
+      result: settlement.result as unknown as Record<string, unknown>,
+      enabled: this.laneGitEnabled,
+      advertised:
+        registration?.capabilities.workspaceTools?.commandResultFeatures?.includes('lane_git') === true,
+    });
+    if (dropped === undefined) return settlement;
+    // Reason only: never the branch, the head or anything else from the result.
+    logger.debug('Dropped lane Git from a command settlement', { reason: dropped, assignmentId });
+    return withoutLaneGit(settlement);
   }
 
   async cancelled(

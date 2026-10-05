@@ -158,7 +158,7 @@ function gitEnvironment(): NodeJS.ProcessEnv {
   };
 }
 
-async function git(
+export async function git(
   cwd: string,
   args: string[],
   signal?: AbortSignal,
@@ -169,6 +169,23 @@ async function git(
     'git',
     ['--no-optional-locks', '-C', cwd, '-c', 'core.fsmonitor=false', ...args],
     { encoding: 'utf8', env: gitEnvironment(), maxBuffer, signal, timeout },
+  );
+  return stdout;
+}
+
+/** Same invocation as `git`, but the raw stdout bytes, for callers that must not accept lossy decoding. */
+export async function gitBytes(
+  cwd: string,
+  args: string[],
+  signal?: AbortSignal,
+  timeout = GIT_TIMEOUT_MS,
+  maxBuffer = GIT_OUTPUT_LIMIT,
+  extraEnvironment: Record<string, string> = {},
+): Promise<Buffer> {
+  const { stdout } = await execFileAsync(
+    'git',
+    ['--no-optional-locks', '-C', cwd, '-c', 'core.fsmonitor=false', ...args],
+    { encoding: 'buffer', env: { ...gitEnvironment(), ...extraEnvironment }, maxBuffer, signal, timeout },
   );
   return stdout;
 }
