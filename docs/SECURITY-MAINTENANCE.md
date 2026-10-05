@@ -48,40 +48,107 @@ are denied even for messages without descriptors and for inherited sockets.
 Keep `io_uring_setup`, `io_uring_enter`, and `io_uring_register` denied: ring
 operations can submit sends without passing through these syscall filters.
 
-Unlike the UDF sandbox's socket-family restriction, this sandbox retains
-AF_UNIX and `socketpair` for `/tmp/tcs.sock` and ordinary IPC using reads,
-writes, and `sendto`. Python multiprocessing pipes, queues, and pools remain
-supported; transferring socket/file handles through `multiprocessing.reduction`
-or similar descriptor-passing APIs returns EPERM. Do not restore `sendmsg` or
-`sendmmsg` to make those APIs work without reassessing the kernel boundary.
+The job policy denies every `socket()` family (VSOCK retains its KILL action).
+It allows only AF_UNIX SOCK_STREAM `socketpair` with protocol 0, including
+CLOEXEC/NONBLOCK flags. Python asyncio and duplex multiprocessing pipes need
+these anonymous socketpairs. Ordinary fork/spawn queues and pools are covered
+by native tests. Named Unix listeners, `multiprocessing.Manager`, datagram or
+seqpacket pairs, and descriptor-sharing APIs are unsupported. The send and
+io_uring denials still prevent SCM_RIGHTS descriptor graphs on allowed pairs.
 
 This mitigation is separate from PI-futex filtering. Verify vendor patches for
 the deployed guest and node kernels; a policy update does not establish patch
 status. Rebuild and replace sandbox runner images to deploy the policy change.
 
-The native `NsJail IPC Filter` CI jobs compile the rendered policy with the
-image's pinned Kafel on amd64 and arm64, install it in a Linux process, and
-check descriptor sends, inherited sockets, Unix HTTP, and Python fork/spawn
-queues and pools. This validates the filter and IPC compatibility, not a
-production kernel's patch status or the full microVM deployment.
+## Tool-call pipe transport
 
-### Planned transport hardening
+Authorized blocking Python invocations receive two anonymous pipe endpoints:
+FD 3 writes requests and FD 4 reads responses. No tool-call socket path is
+mounted in the jail. The signed, body-bound `tool_call_socket` boolean remains
+the wire capability name for compatibility with manifest verification; it now
+grants pipes. Ordinary executions, compile steps, and replay/Bash tool calls
+receive no endpoints. The Python client makes both ends non-inheritable before
+user code runs and refuses tool calls from forked children.
 
-Replace the job-visible Unix HTTP socket with two dedicated per-job pipes to
-a trusted broker. Keep them separate from stdin/stdout/stderr, which carry user
-input and execution output. Limit message sizes, outstanding requests, and
-timeouts; retain the existing job authorization and tool-call budgets at the
-broker. Update each language's tool-call client to use framed messages, and
-explicitly preserve only these pipe FDs through NsJail and `spec-guard`.
-The current guard closes all FDs above 2; a redesign must preserve its protection
-against unrelated inherited descriptors.
+A Node broker starts per invocation after MicroVM restore and forwards only
+POST `/tool-call` to the configured `SANDBOX_FORWARD_TARGET`. It forwards only
+the three PTC claim headers; upstream session/token/tool authorization remains
+in force. It never follows redirects. Each channel bounds frames and upstream
+responses to 1 MiB, active upstream requests to 16, admission to a 64-request
+burst refilling at 20 requests/second, partial-frame and response-drain stalls
+to 5 seconds, and upstream requests to the job timeout (5–600 seconds).
+Malformed framing closes the invocation; disconnect/exit aborts upstream work.
+The Python client correlates concurrent responses by frame ID.
 
-Then deny `socket` and `socketpair` in the job policy and retain the send and
-io_uring denials. Validate language/runtime compatibility, including Python's
-multiprocessing resource tracker and descriptor-sharing features, before making
-that stricter policy the default. The broker retains network access outside the
-job filter; it must not expose raw socket handles to the job. This is follow-up
-work, not part of the immediate descriptor-passing mitigation.
+Node/Bun extra stdio descriptors are socketpairs. A small trusted C relay
+converts the broker's channel into real anonymous pipes before execing NsJail.
+NsJail explicitly passes only FDs 3/4; `spec-guard --tool-call-pipes` checks their
+FIFO type and access direction, retains those two ends, and closes unrelated
+FDs. Its ordinary mode still closes every descriptor above 2. API/broker/relay
+parent-death handling kills the invocation if either supervisor disappears.
+Each invocation adds a Node broker and C relay outside the job cgroup; size
+runner CPU/memory and PID limits for the configured simultaneous-job count.
+
+The amd64/arm64 `NsJail IPC Filter` CI jobs compile the policy with pinned Kafel,
+exercise socket/send denials plus asyncio/multiprocessing, check guard FD
+cleanup, and run the actual broker/relay/NsJail/guard/generated Python client
+with concurrent replies. These checks do not boot libkrun or establish deployed
+kernel patch status.
+
+Every complete frame consumes the admission budget before JSON or claim
+validation, including frames rejected by the active-request limit. Exhausting
+that budget closes the channel and terminates the invocation instead of
+producing an unlimited stream of rejection replies. Losing the response pipe's
+reader also terminates the invocation, even when no reply is buffered.
+
+The standalone launcher guest, API runner and combined worker runner all
+package Node, the broker bundle and the compiled pipe bridge. Native CI builds
+the standalone launcher guest on both architectures and exercises a round trip
+using that image's own binaries.
+
+### Local Mac/Docker canary
+
+`tests/tool_call_runner.cjs` exercises signed API authorization, the normal
+NsJail mount/user/PID/network/IPC/UTS/cgroup namespaces, the generated Python
+client, concurrent tool calls, descriptor cleanup, spawn/fork pipe IPC, ordinary
+Python jobs and basic Bun JavaScript/TypeScript execution. Spawned workers can
+import the preamble but cannot issue tool calls. Python 3.14's default forkserver
+requires a named Unix listener and is denied; select an explicit spawn or fork
+context. Semaphore-based pools/queues require `/dev/shm`, which the default jail
+does not mount. The namespace-disabled native policy tests cover those APIs
+when shared memory exists, not their availability in the default jail.
+
+With runtime packages built by `build-packages.sh` (or a compatible `/pkgs`
+tree containing Python 3.14.4 and Bun 1.4.2), run from the repository root:
+
+```sh
+bun service/scripts/dump-pipe-preamble.ts > /tmp/codeapi-pipe-client.py
+docker build -f api/Dockerfile --target sandbox-build -t codeapi-pipe-canary .
+docker run --rm --init \
+  --cap-add SYS_ADMIN --cap-add SYS_CHROOT --cap-add SETUID \
+  --cap-add SETGID --cap-add NET_ADMIN \
+  --security-opt seccomp=./seccomp/nsjail.json \
+  --mount "type=bind,source=$PWD/data/pkgs,target=/pkgs,readonly" \
+  --mount "type=bind,source=/tmp/codeapi-pipe-client.py,target=/client.py,readonly" \
+  --mount "type=bind,source=$PWD/tests,target=/tests,readonly" \
+  --entrypoint /usr/local/bin/node \
+  codeapi-pipe-canary /tests/tool_call_runner.cjs /client.py
+```
+
+The canary disables resource cgroup enforcement as the Mac compose override
+does, while retaining the cgroup namespace and all remaining NsJail isolation.
+It exercises Docker's Linux VM, not a libkrun guest. It does not establish
+production kernel patch status or third-party language-package compatibility.
+
+### Coordinated rollout
+
+Deploy the service's new blocking preamble together with rebuilt runner images
+containing the broker, relay and updated guard/policy. Drain old blocking jobs
+and route new blocking requests only to matching images during rollout. Old
+socket preambles fail on pipe-only runners; new pipe preambles fail immediately
+on old runners. There is no TCP or Unix-socket fallback. Replay mode is unchanged.
+Rollback must restore both service and runner versions; retain #309's send and
+io_uring denials. See [ADR 0011](adr/0011-tool-call-pipes.md) for the design.
 
 ## Preserve host-side confinement
 
