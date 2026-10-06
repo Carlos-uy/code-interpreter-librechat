@@ -3,6 +3,9 @@
 Provider-neutral protocol and worker CLI for attaching a stateful, sandboxed
 code environment to LibreChat Code API.
 
+Requires Node.js 22.21 or newer. CI tests Node.js 22 and 24; Node.js 20 is
+unsupported.
+
 For a complete machine setup and operations guide, see the
 [self-hosted worker runbook](../../docs/remote-bridge/worker-runbook.md).
 
@@ -640,7 +643,18 @@ fails, the worker still checks the rest and rejects the whole batch with one
 batch messages shorten reasons and source excerpts to stay within the bound,
 but never omit failing edit positions. A missing edit names the nearest
 candidate line and flags elided (`...`) or line-numbered `oldText`, a
-whitespace-only difference, or CRLF line endings.
+whitespace-only difference, or CRLF line endings. When the file has a region
+that `oldText` most likely meant (the alignment where the most of its
+distinctive lines fall into place, or its unique first line or closest line),
+the reason ends with `the current text at lines A-B (~ whitespace differs, !
+text differs) is "<rows>"`: a JSON string of at most 8 rows of the form
+`<line>|<mark><text>`, each line shortened to 160 characters, where the mark is
+a space for a line identical to `oldText` at that position, `~` when only its
+whitespace differs and `!` when its text differs. Excerpts are the first detail
+dropped to fit the message bound, and never shorten another edit's reason. Both
+the excerpt (1,600 bytes) and the message that carries it (3,800 bytes) are
+measured as UTF-8 once JSON-encoded, so the Code API's error body stays within
+the 4,096 bytes hosts such as LibreChat read.
 An ambiguous edit gives its match count and line numbers. Overlapping
 occurrences count as separate locations. Detailed source-line excerpts require
 `read_file` or `preview_edit` on the same workspace; edit-only workers return a
@@ -718,9 +732,10 @@ native SRT command backend. This operator switch controls availability;
 LibreChat tool approval hooks remain the user-facing allow/deny boundary for
 each invocation.
 
-Reads reject absolute paths, traversal, escaping symlinks, non-regular files,
-and files larger than 1 MiB. The opened file is checked against its canonical
-in-workspace inode before it is read. Text search uses `rg` only to enumerate a
+Reads reject absolute paths, traversal, escaping symlinks, and non-regular files.
+The opened file is checked against its canonical in-workspace inode before it is
+read. Ordinary reads stream bounded line windows even from files larger than 1 MiB;
+see the [read contract](WORKSPACE-READS.md). Text search uses `rg` only to enumerate a
 bounded set of ignored-aware candidates with configuration and symlink following
 disabled. It then opens and verifies each candidate through the same confined
 1 MiB read boundary before matching locally. File listing invokes `rg` without
@@ -947,6 +962,63 @@ be combined with conversation worktrees. Code API must advertise
 `supportedWorkspaceScopes`; older deployments do not, and the worker omits the
 scope for them. Deploy consumers that read worker status (such as LibreChat)
 with support for `workspaceScopes` before enabling lanes on a worker.
+
+##### Retiring stale linked worktrees
+
+Nothing else removes a task's worktree once its work is pushed, and each one
+keeps its own dependencies and build output. A worker with lanes therefore
+retires stale ones itself, with no configuration: a pass runs two minutes after
+startup and every six hours after that, sooner while a backlog remains, and
+also before managed environment setup would be deferred for low disk space.
+Passes run in the background and never overlap. Only an actual removal holds
+back requests, and only those for that lane or its checkout.
+
+A worktree in a writable registered root is retired only when **all** of these
+hold; otherwise it is kept and the reason is counted:
+
+- It verifies as a linked worktree of the checkout under `.worktrees/`, as for
+  lane admission. The checkout itself and worktrees elsewhere are never
+  touched.
+- Neither the lane nor its checkout has a request in flight or ran one while
+  the worktree was being inspected, and both this
+  worker's last use of the lane and the newest on-disk activity (the worktree
+  directory and its Git `HEAD`, `index`, `logs/HEAD`, `ORIG_HEAD` and
+  `FETCH_HEAD`) are older than the idle threshold, seven days by default.
+- It has no modified tracked files and no untracked files the repository does
+  not ignore; no merge, rebase, cherry-pick, revert or bisect in progress; no
+  `git worktree lock`; and no quarantine on the lane or its checkout.
+- Its `HEAD` commit, including a detached one, is contained in at least one
+  remote-tracking ref (`refs/remotes/*`), or its work is already in the
+  remote's default branch by content, as after a squash or rebase merge whose
+  remote branch was deleted. Content counts only when `HEAD` has no live
+  upstream (it is detached, never pushed, or its upstream ref is gone) and
+  either every commit beyond the default branch is patch-equivalent to one in
+  it (`git cherry` shows only `-`, with no merge commits), or the default
+  branch has identical content at every path the branch changed since their
+  merge base. The default branch is the remote's `HEAD`, else `main` or
+  `master`, as last fetched; the worker never fetches or calls a hosting API.
+  Commits beyond a live upstream are never treated as merged.
+
+Removal is `git worktree remove` **without** `--force`, so Git re-checks for
+changes itself and deletes only that worktree's metadata. No repository-wide
+`git worktree prune` runs, so other registered worktrees that are temporarily
+unavailable stay registered. Removal has no timeout, because a half-deleted
+worktree could no longer be recognized. Ignored files such as `node_modules`,
+build output and ignored `.env` files go with the worktree; that is the space
+being reclaimed. The branch is kept, so
+`git worktree add .worktrees/<name> <branch>` restores the worktree. Lane and
+checkout requests that arrive during a removal wait for it, or for their own
+cancellation; a lane request then fails as an unknown worktree. Each pass reads
+every `.worktrees` entry, inspects at most 128 idle worktrees and removes at
+most 32, oldest first, rotating so that worktrees kept for lasting reasons
+cannot hide the rest. Each pass logs one summary line, for example
+`worktree retirement: retired 3, kept 12 (dirty 2, recent 8, unpushed 2), freed
+about 4.1 GiB`; set `LIBRECHAT_CODE_LOG_LEVEL=debug` to log every kept worktree
+and its reason.
+
+Pass `--no-worktree-retirement` or set `LIBRECHAT_CODE_WORKTREE_RETIREMENT=false`
+to disable retirement. Change the idle threshold with `--worktree-idle-days <n>`
+or `LIBRECHAT_CODE_WORKTREE_IDLE_DAYS=<n>` (1 to 3650 days).
 
 On an updated Code API, admission waits up to 30 seconds without the
 `X-LibreChat-Workspace-Queue-Wait-Ms` request header. A caller may advertise a

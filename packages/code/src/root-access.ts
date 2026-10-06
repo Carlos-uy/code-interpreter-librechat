@@ -350,7 +350,7 @@ export class WorkspaceRootAccess {
         }
     }
 
-    entry(path: string, operation: 'mkdir' | 'symlink' | 'readlink', target?: string): string | void {
+    entry(path: string, operation: 'mkdir' | 'symlink' | 'readlink', target?: string, mode = 0o700): string | void {
         const parent = this.parent(path);
         try {
             if (operation === 'readlink') {
@@ -361,7 +361,7 @@ export class WorkspaceRootAccess {
                 return buffer.subarray(0, length).toString();
             }
             const result = operation === 'mkdir'
-                ? mkdirAt!(parent.fd, parent.name, 0o700)
+                ? mkdirAt!(parent.fd, parent.name, mode)
                 : symlinkAt!(target!, parent.fd, parent.name);
             if (result !== 0) throw nativeError();
         } finally { closeSync(parent.fd); }
@@ -378,6 +378,14 @@ export class WorkspaceRootAccess {
 }
 
 const context = new AsyncLocalStorage<WorkspaceRootAccess>();
+const deferredCleanup = new WeakSet<WorkspaceRootAccess>();
+/** Interrupted I/O must not hold a request open while Node drains its handles. */
+export function deferWorkspaceRootCleanup(): void {
+    const access = context.getStore();
+    if (access) deferredCleanup.add(access);
+}
+/** Whether filesystem adapters in this call are anchored to a held root descriptor. */
+export const holdsWorkspaceRoot = (): boolean => context.getStore() != null;
 export async function withWorkspaceRoot<T>(
     root: string,
     identity: WorkspaceRootIdentity | undefined,
@@ -388,7 +396,9 @@ export async function withWorkspaceRoot<T>(
     try {
         return await context.run(access, action);
     } finally {
-        await access.close();
+        const closing = access.close();
+        if (deferredCleanup.delete(access)) void closing.catch(() => {});
+        else await closing;
     }
 }
 
@@ -504,10 +514,10 @@ export const readdir = async (path: string, maxEntries = 200_000): Promise<strin
 };
 export const readlink = async (path: string): Promise<string> =>
     context.getStore()?.entry(path, 'readlink') as string ?? fs.readlink(path);
-export const mkdir = async (path: string): Promise<void> => {
+export const mkdir = async (path: string, mode = 0o700): Promise<void> => {
     const access = context.getStore();
-    if (access) access.entry(path, 'mkdir');
-    else await fs.mkdir(path, { mode: 0o700 });
+    if (access) access.entry(path, 'mkdir', undefined, mode);
+    else await fs.mkdir(path, { mode });
 };
 export const symlink = async (target: string, path: string): Promise<void> => {
     const access = context.getStore();
