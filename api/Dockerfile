@@ -152,6 +152,13 @@ COPY api/config ./config
 
 RUN bun run build
 
+# The microVM guest does not inherit Dockerfile ENV: the launcher forwards only
+# an allow-list of variables and SANDBOX_PIPE_ADDON is not on it, so
+# pipe-process.ts falls back to /sandbox_api/.build/anonymous-pipes.node, which
+# was never created ("Failed to spawn nsjail: Cannot find module ..."). Place the
+# addon at that fallback path so it resolves without the env var.
+RUN cp /usr/local/lib/anonymous-pipes.node /sandbox_api/.build/anonymous-pipes.node
+
 RUN mkdir -p /pkgs /tmp/sandbox
 
 RUN find / -xdev -perm /6000 -exec chmod ug-s {} + 2>/dev/null || true
