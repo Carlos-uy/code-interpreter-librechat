@@ -125,6 +125,15 @@ RUN apt-get update && \
 # in its minimal build.
 RUN [ -x /usr/bin/mawk ] && ln -sf /usr/bin/mawk /usr/bin/awk
 
+# Resolve every update-alternatives symlink in /usr/bin and /usr/sbin to its
+# real target. NsJail mounts /usr read-only but NOT /etc, so links such as
+# `which -> /etc/alternatives/which` dangle inside the jail and the command
+# fails with exit 127 (this broke R's utils/stats loading via Sys.which()).
+RUN for l in $(find /usr/bin /usr/sbin -type l -lname '/etc/alternatives/*'); do \
+      t="$(readlink -f "$l")"; \
+      if [ -e "$t" ]; then ln -sf "$t" "$l"; fi; \
+    done
+
 RUN sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
 
 COPY --from=nsjail-builder /nsjail/nsjail /usr/sbin/nsjail
