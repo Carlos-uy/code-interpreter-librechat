@@ -46,10 +46,12 @@ jobs:
             dockerfile: service/Dockerfile.tool-call-server
             target: production
 
-          # --- Ejecutor Estricto VM (KVM / MicroVM) ---
+          # --- Ejecutor (microVM, paquetes del host) ---
+          # Se construye desde api/Dockerfile (el mantenido, con el parche de
+          # anonymous-pipes.node); launcher/Dockerfile es una copia atrasada.
           - service: librechat_sandbox-runner
-            dockerfile: launcher/Dockerfile
-            target: ""
+            dockerfile: api/Dockerfile
+            target: sandbox-runner
 
     steps:
       - name: Checkout del repositorio
