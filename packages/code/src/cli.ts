@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { readdir, realpath, stat } from 'node:fs/promises';
+import { lstat, readdir, realpath, stat } from 'node:fs/promises';
 import { basename, dirname, join, resolve, relative, isAbsolute, sep } from 'node:path';
 
 import { pairBridgeWorker } from './pairing.js';
 import { runSetupCommand } from './setup-cli.js';
+import { browserSetupProtectedPaths } from './browser-setup.js';
+import { assertPrivateStorageAncestors } from './private-storage.js';
 import { profileRunConfiguration } from './setup.js';
 import { assertWorkerProfileIsolation } from './worker-profile.js';
 import type { WorkerProfile } from './worker-profile.js';
@@ -437,6 +439,7 @@ async function run(
   const pairedIdentity = identityPath
     ? await loadBridgeIdentity(identityPath)
     : undefined;
+  const setupProtectedPaths = browserSetupProtectedPaths(pairedIdentity?.setupAttemptPath);
   const workerId = required(
     'LIBRECHAT_CODE_WORKER_ID',
     configuredWorkerId ?? pairedIdentity?.workerId,
@@ -850,6 +853,19 @@ async function run(
       }),
     ]),
   );
+  for (const path of setupProtectedPaths) {
+    const namespace = await lstat(path).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return undefined;
+      throw error;
+    });
+    if (!namespace) continue;
+    if (!namespace.isDirectory() || namespace.isSymbolicLink())
+      throw new Error('Setup journal namespace must be a private directory, not a symlink');
+    const sourceParents = await assertPrivateStorageAncestors(path);
+    await assertEnvironmentDefinitionsOutsideRoots([{
+      path, sourceParents, definition: { name: 'setup-state', root: path }, fingerprint: '',
+    }], roots);
+  }
   const preparationDirectory = join(dirname(identityPath ?? defaultBridgeIdentityPath(workerId)), 'environment-preparation');
   if (environments.some(environment => environment.definition.setup?.reuse)) {
     const sourceParents = await prepareEnvironmentPreparationDirectory(preparationDirectory);
@@ -865,13 +881,13 @@ async function run(
     definition: { name: 'shared-resource', root: resource.path }, fingerprint: '',
   })));
   await assertEnvironmentResourceIsolation(environments.flatMap(environment => environment.resources ?? []), roots.map(root => root.root), [
-    identityPath, preparationDirectory, github.privateKeyPath,
+    identityPath, ...setupProtectedPaths, preparationDirectory, github.privateKeyPath,
     ...environments.map(environment => environment.path), ...rootQuarantinePaths.values(),
   ].filter((path): path is string => path != null));
   await assertEnvironmentDefinitionsOutsideRoots(resourceRoots, roots);
   const snapshotStores = environments.flatMap(environment => environment.snapshotStore ? [environment.snapshotStore] : []);
   await assertEnvironmentResourceIsolation(snapshotStores.map(store => ({ kind: 'npm-cache' as const, path: store.store, access: 'read-only' as const })), roots.map(root => root.root), [
-    identityPath, preparationDirectory, github.privateKeyPath, ...environments.map(environment => environment.path),
+    identityPath, ...setupProtectedPaths, preparationDirectory, github.privateKeyPath, ...environments.map(environment => environment.path),
     ...rootQuarantinePaths.values(), ...environments.flatMap(environment => (environment.resources ?? []).map(resource => resource.path)),
   ].filter((path): path is string => path != null));
   await assertEnvironmentDefinitionsOutsideRoots(snapshotStores.map(store => ({ path: store.store, sourceParents: store.controlPaths,
@@ -1101,6 +1117,7 @@ async function run(
     protectedPaths: [
       identityPath,
       savedProfile?.path,
+      ...setupProtectedPaths,
       ...(environments.some(environment => environment.definition.setup?.reuse) ? [preparationDirectory] : []),
       ...snapshotStores.map(store => store.store),
             ...environments.map(environment => environment.path),
@@ -1491,8 +1508,14 @@ async function run(
     throw error;
   }
   worktreeRetirementScheduler?.start();
+  let readinessReported = false;
   try {
     const worker = new BridgeWorker({
+      onReady: () => {
+        if (readinessReported) return;
+        readinessReported = true;
+        process.stdout.write('librechat-code: connected and ready\n');
+      },
       instructionDescriptors: () => localWorkspaceTools?.instructionDescriptors() ?? Promise.resolve(undefined),
       codeApiUrl,
       token: configuredToken,
@@ -1778,7 +1801,7 @@ async function main(): Promise<void> {
   if (args.length === 1 && (args[0] === '--help' || args[0] === 'help')) {
     process.stdout.write(`Usage: librechat-code <command>
 
-  setup             Guided pairing and private profile setup
+  setup --instance <url>  Browser-approved enrollment and private profile setup
   run [--profile <file>]  Start a saved profile or existing worker configuration
   pair <url> <code> --worker-id <id>  Existing one-time pairing flow
   projects --root <directory>       Inspect local Git projects
