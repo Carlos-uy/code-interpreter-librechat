@@ -4,6 +4,7 @@ import { deferWorkspaceRootCleanup, holdsWorkspaceRoot, link, lstat, mkdir, open
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 
 import type { FileHandle } from 'node:fs/promises';
+import type { CommandFailureDiagnostic } from './command-diagnostics.js';
 import { matchesWorkspaceRoot } from './root-identity.js';
 import type { WorkspaceRootIdentity } from './root-identity.js';
 
@@ -197,6 +198,8 @@ export class WorkspaceToolError extends Error {
     public readonly mutationMayHaveCommitted = false,
     /** Retain the durable mutation guard when process or write settlement is uncertain. */
     public readonly requiresQuarantine = mutationMayHaveCommitted,
+    /** Worker-local diagnostic metadata; never serialized into bridge settlements. */
+    public readonly commandDiagnostic?: CommandFailureDiagnostic,
   ) {
     super(message);
     this.name = 'WorkspaceToolError';
@@ -2163,7 +2166,7 @@ export class SandboxWorkspaceTools implements WorkspaceToolExecutor {
         ) {
           throw error;
         }
-        throw new WorkspaceToolError(error.message, error.code, true);
+        throw new WorkspaceToolError(error.message, error.code, true, true, error.commandDiagnostic);
       }
       throw new WorkspaceToolError(
         'Sandboxed command execution unavailable',
